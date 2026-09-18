@@ -32,7 +32,7 @@
 
 set -uo pipefail
 
-VERSION="1.0"
+VERSION="1.1"
 
 REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
@@ -123,10 +123,15 @@ Usage:
   inovatils                          interactive menu
   inovatils list                     list scripts and their status
   inovatils status                   alias for "list"
-  inovatils install <script>         install a script
+  inovatils install                  install all available scripts
+  inovatils install <script>         install a specific script
+  inovatils i                        alias for "install"
+  inovatils uninstall                uninstall all available scripts
+  inovatils uninstall <script>       uninstall a specific script
+  inovatils u                        alias for "uninstall"
   inovatils update                   update all installed scripts
   inovatils update <script>          update a specific script
-  inovatils remove <script>          remove an installed script
+  inovatils remove <script>          alias for "uninstall <script>"
   inovatils self-update              update the CLI + manager
   inovatils <script>                 shortcut: install <script>
 

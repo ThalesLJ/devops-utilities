@@ -4,7 +4,7 @@
 # Docker Engine & Compose — Automated Service Installer & Safe Updater
 #
 # Maintainer: Inova e-Business
-# Version: 1.2
+# Version: 1.3
 #
 # Purpose:
 #   Install and safely update Docker Engine and Docker Compose V2 to the latest
@@ -54,7 +54,7 @@ fi
 
 set -uo pipefail
 
-VERSION="1.2"
+VERSION="1.3"
 TAG="service-docker"
 
 # -----------------------------------------------------------------------------
@@ -166,6 +166,57 @@ run_elevated() {
     fi
 }
 
+request_destructive_authentication() {
+    local target_name="$1"
+    local prompt_msg="  [AUTENTICAÇÃO] Digite a senha de sudo para autorizar a DESINSTALAÇÃO de ${target_name}: "
+
+    printf '\n'
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        # Running via sudo as root: reset cached credential and prompt invoking user
+        sudo -u "$SUDO_USER" sudo -k 2>/dev/null || true
+        sudo -k 2>/dev/null || true
+        if ! sudo -u "$SUDO_USER" sudo -v -p "$prompt_msg" 2>/dev/null; then
+            if ! sudo -v -p "$prompt_msg"; then
+                err "Autenticação cancelada ou senha incorreta. Operação abortada."
+                exit 1
+            fi
+        fi
+    elif [ "$(id -u)" -ne 0 ]; then
+        # Running as standard user
+        sudo -k 2>/dev/null || true
+        if ! sudo -v -p "$prompt_msg"; then
+            err "Autenticação cancelada ou senha incorreta. Operação abortada."
+            exit 1
+        fi
+    else
+        # Pure root (e.g. direct root shell)
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -k 2>/dev/null || true
+        fi
+    fi
+    return 0
+}
+
+confirm_destructive_action() {
+    local target_name="$1"
+    printf '\n'
+    printf '  %s\n' "${C_RED}${C_BOLD}Confirmação Obrigatória:${C_RESET}"
+    printf '  Para autorizar a destruição e remoção completa de %s,\n' "${C_BOLD}${target_name}${C_RESET}"
+    printf '  digite exatamente %s abaixo:\n\n' "${C_RED}${C_BOLD}UNINSTALL${C_RESET}"
+    printf '  Confirmação: ' > /dev/tty 2>/dev/null || printf '  Confirmação: '
+    local resp=""
+    if [ -r /dev/tty ]; then
+        read -r resp < /dev/tty
+    else
+        read -r resp
+    fi
+    if [ "$resp" != "UNINSTALL" ]; then
+        printf '\n'
+        info "Confirmação cancelada ou palavra incorreta ('$resp'). Nenhuma alteração foi feita."
+        exit 0
+    fi
+}
+
 ask() {
     if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
     local answer
@@ -210,6 +261,7 @@ Options:
       --rollback          Roll back to the previous Docker & Compose version and restore state.
       --snapshot-only     Only generate the pre-update runtime state snapshot (.txt).
       --status            Show current Docker installation status, compose stacks and workload.
+      --uninstall         Completely purge Docker Engine, Compose, containers, images and volumes.
   -h, --help              Show this help message.
 
 Examples:
@@ -253,6 +305,7 @@ while [ $# -gt 0 ]; do
         --rollback)         ACTION="rollback"; shift ;;
         --snapshot-only)    SNAPSHOT_ONLY=1; ACTION="snapshot"; shift ;;
         --status)           ACTION="status"; shift ;;
+        --uninstall|--purge) ACTION="uninstall"; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -1166,14 +1219,138 @@ action_main() {
     printf '\n'
 }
 
+action_uninstall() {
+    print_banner
+    printf '\n'
+    printf '  %s\n' "${C_RED}████████████████████████████████████████████████████████████${C_RESET}"
+    printf '  %s\n' "${C_RED}${C_BOLD}  [AVISO CRÍTICO] DESINSTALAÇÃO COMPLETA E PURGA DO DOCKER   ${C_RESET}"
+    printf '  %s\n' "${C_RED}████████████████████████████████████████████████████████████${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "${C_RED}${C_BOLD}ATENÇÃO: ESTA AÇÃO É TOTALMENTE DESTRUTIVA E IRREVERSÍVEL!${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "O que acontecerá ao prosseguir com a desinstalação:"
+    printf '    %s %s\n' "1." "TODOS os containers em execução no sistema serão interrompidos e removidos."
+    printf '    %s %s\n' "2." "TODAS as imagens, volumes persistentes e redes serão DELETADOS (/var/lib/docker)."
+    printf '    %s %s\n' "3." "Todos os pacotes Docker (Engine, CLI, containerd, Compose V2) serão PURGADOS."
+    printf '    %s %s\n' "4." "Os repositórios oficiais e chaves GPG do Docker serão removidos do sistema operacional."
+    printf '    %s %s\n' "5." "As configurações em /etc/docker e o grupo 'docker' serão permanentemente excluídos."
+    printf '    %s %s\n' "6." "Os serviços de sistema (docker.service, docker.socket, containerd.service) serão desativados."
+    printf '\n'
+    warn "Nenhum container, banco de dados ou aplicação Docker continuará existindo após esta operação!"
+
+    # Solicitar senha e confirmação explícita
+    request_destructive_authentication "Docker Engine & Compose"
+    confirm_destructive_action "Docker Engine & Compose"
+
+    print_section "Executando Desinstalação Completa do Docker"
+    acquire_lock
+
+    # 1. Parar containers
+    if command -v docker >/dev/null 2>&1; then
+        info "Interrompendo todos os containers Docker em execução..."
+        local running_c
+        running_c="$(docker ps -q 2>/dev/null || true)"
+        if [ -n "$running_c" ]; then
+            docker stop $running_c >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # 2. Parar e desativar serviços systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        info "Parando e desativando serviços do Docker e containerd..."
+        run_elevated systemctl stop docker.service docker.socket containerd.service 2>/dev/null || true
+        run_elevated systemctl disable docker.service docker.socket containerd.service 2>/dev/null || true
+    fi
+
+    # 3. Detectar gerenciador de pacotes e purgar
+    detect_environment || true
+    case "$PKG_MGR" in
+        apt-get)
+            info "Purgando pacotes do Docker via apt-get..."
+            run_elevated apt-get purge -y \
+                docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+                docker-compose-plugin docker-ce-rootless-extras docker.io \
+                docker-compose docker-doc podman-docker 2>/dev/null || true
+            run_elevated apt-get autoremove --purge -y 2>/dev/null || true
+            ;;
+        dnf|yum)
+            info "Removendo pacotes do Docker via $PKG_MGR..."
+            run_elevated "$PKG_MGR" remove -y \
+                docker-ce docker-ce-cli containerd.io docker-buildx-plugin \
+                docker-compose-plugin docker-ce-rootless-extras docker \
+                docker-client docker-client-latest docker-common \
+                docker-latest docker-latest-logrotate docker-logrotate \
+                docker-engine podman runc 2>/dev/null || true
+            ;;
+        pacman)
+            info "Removendo pacotes do Docker via pacman..."
+            run_elevated pacman -Rns --noconfirm docker docker-compose containerd 2>/dev/null || true
+            ;;
+        *)
+            warn "Gerenciador de pacotes não identificado diretamente. Tentando apt-get..."
+            if command -v apt-get >/dev/null 2>&1; then
+                run_elevated apt-get purge -y docker-ce docker-ce-cli containerd.io docker-compose-plugin 2>/dev/null || true
+            fi
+            ;;
+    esac
+
+    # 4. Remover repositórios e chaves GPG
+    info "Removendo repositórios oficiais e chaves GPG..."
+    run_elevated rm -f /etc/apt/sources.list.d/docker.list \
+                       /etc/apt/sources.list.d/docker-*.list \
+                       /etc/apt/keyrings/docker.asc \
+                       /etc/apt/keyrings/docker.gpg \
+                       /etc/apt/trusted.gpg.d/docker.gpg \
+                       /etc/yum.repos.d/docker-ce.repo 2>/dev/null || true
+
+    # 5. Desmontar pontos de montagem do overlay em /var/lib/docker se existirem
+    if [ -f /proc/mounts ]; then
+        awk '{print $2}' /proc/mounts 2>/dev/null | grep -E '^/var/lib/docker' | sort -r | while read -r mnt; do
+            run_elevated umount -f "$mnt" 2>/dev/null || true
+        done
+    fi
+
+    # 6. Deletar diretórios de dados, imagens, volumes e sockets
+    info "Excluindo diretórios de dados, volumes, imagens e runtime..."
+    run_elevated rm -rf /var/lib/docker \
+                       /var/lib/containerd \
+                       /etc/docker \
+                       /var/run/docker.sock \
+                       /run/docker.sock \
+                       /var/run/docker \
+                       /run/docker \
+                       /root/.docker
+
+    # 7. Remover grupo docker se existir
+    if getent group docker >/dev/null 2>&1; then
+        info "Removendo grupo de sistema 'docker'..."
+        run_elevated groupdel docker 2>/dev/null || true
+    fi
+
+    # 8. Atualizar systemd daemon
+    if command -v systemctl >/dev/null 2>&1; then
+        run_elevated systemctl daemon-reload 2>/dev/null || true
+        run_elevated systemctl reset-failed 2>/dev/null || true
+    fi
+
+    # 9. Limpar arquivos de rollback
+    run_elevated rm -f "${LOG_DIR}/docker-rollback-manifest.env" 2>/dev/null || true
+
+    print_section "Desinstalação Concluída"
+    ok "Docker Engine, Compose V2 e todos os dados associados foram completamente removidos do sistema."
+    printf '\n'
+    exit 0
+}
+
 # -----------------------------------------------------------------------------
 # Dispatch
 # -----------------------------------------------------------------------------
 case "$ACTION" in
-    status)   action_status ;;
-    snapshot) action_snapshot ;;
-    rollback) perform_rollback ;;
-    check)    action_main ;;
-    run)      action_main ;;
-    *)        err "Unknown action: $ACTION"; usage; exit 1 ;;
+    status)    action_status ;;
+    snapshot)  action_snapshot ;;
+    rollback)  perform_rollback ;;
+    uninstall) action_uninstall ;;
+    check)     action_main ;;
+    run)       action_main ;;
+    *)         err "Unknown action: $ACTION"; usage; exit 1 ;;
 esac

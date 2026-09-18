@@ -4,7 +4,7 @@
 # DevOps Utilities - Installer & Manager
 #
 # Maintainer: Inova e-Business
-# Version: 2.10
+# Version: 2.11
 #
 # Purpose:
 #   Install, run, track, update and remove the DevOps Utilities scripts from
@@ -47,7 +47,7 @@
 
 set -uo pipefail
 
-VERSION="2.10"
+VERSION="2.11"
 
 REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
@@ -309,11 +309,17 @@ do_remove() {
     local name="$1" rec dir dest
     rec="$(manifest_get "$name")"
     if [ -z "$rec" ]; then
-        warn "${name} is not tracked. Nothing to remove."
-        return 0
+        if [ -f "${DEFAULT_INSTALL_DIR}/${name}" ]; then
+            dest="${DEFAULT_INSTALL_DIR}/${name}"
+        else
+            warn "${name} is not tracked. Nothing to remove."
+            return 0
+        fi
+    else
+        dir="$(echo "$rec" | cut -d'|' -f2)"
+        [ -n "$dir" ] || dir="$DEFAULT_INSTALL_DIR"
+        dest="${dir}/${name}"
     fi
-    dir="$(echo "$rec" | cut -d'|' -f2)"
-    dest="${dir}/${name}"
 
     info "Removing ${C_CYAN}${dest}${C_RESET} ..."
     if [ "$(id -u)" -eq 0 ]; then
@@ -824,15 +830,20 @@ Usage:
   inovatils                           interactive menu (global command)
   install.sh list                     list scripts and their status
   install.sh status                   alias for "list"
-  install.sh install <script>         install a script
+  install.sh install                  install all available scripts
+  install.sh install <script>         install a specific script
+  install.sh i                        alias for "install"
+  install.sh uninstall                uninstall all available scripts
+  install.sh uninstall <script>       uninstall a specific script
+  install.sh u                        alias for "uninstall"
   install.sh update                   update all installed scripts
   install.sh update <script>          update a specific script
-  install.sh remove <script>          remove an installed script
+  install.sh remove <script>          alias for "uninstall <script>"
   install.sh self-update              update the manager itself
   install.sh inovatils                install the global \`inovatils\` command
   install.sh <script>                 shortcut: install <script>
 
-  inovatils list | update | remove ...   same commands via the global CLI
+  inovatils i | u | list | update ...   same commands via the global CLI
 
 Options:
   -h, --help                          show this help
@@ -851,7 +862,38 @@ case "$CMD" in
     list|status)   print_header; self_update_check; load_scripts; print_table 0 1 ;;
     self-update)   self_update ;;
     inovatils|cli|install-cli) install_cli "${2:-/usr/local/bin/inovatils}" ;;
-    install)       do_install "${2:-}" "${3:-}" ;;
+    i|install)
+        if [ -n "${2:-}" ]; then
+            do_install "$2" "${3:-}"
+        else
+            load_scripts
+            info "Instalando todos os scripts disponíveis..."
+            for name in "${SCRIPTS_ARR[@]}"; do
+                do_install "$name"
+            done
+            ok "Instalação de todos os scripts concluída."
+        fi
+        ;;
+    u|uninstall|remove|rm)
+        if [ -n "${2:-}" ]; then
+            do_remove "$2"
+        else
+            load_scripts
+            info "Desinstalando todos os scripts disponíveis..."
+            local any=0
+            for name in "${SCRIPTS_ARR[@]}"; do
+                if is_installed "$name" || [ -f "${DEFAULT_INSTALL_DIR}/${name}" ]; then
+                    do_remove "$name"
+                    any=1
+                fi
+            done
+            if [ "$any" -eq 1 ]; then
+                ok "Desinstalação de todos os scripts concluída."
+            else
+                info "Nenhum script instalado encontrado para desinstalar."
+            fi
+        fi
+        ;;
     update)
         if [ -n "${2:-}" ]; then
             do_update "$2"
@@ -862,9 +904,6 @@ case "$CMD" in
             done
             ok "Update pass completed."
         fi
-        ;;
-    remove|rm|uninstall)
-        do_remove "${2:-}"
         ;;
     -h|--help|help)
         usage

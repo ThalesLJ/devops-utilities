@@ -4,7 +4,7 @@
 # Evolution API Service — Installer, Safe Updater & Lifecycle Manager
 #
 # Maintainer: Inova e-Business
-# Version: 1.1
+# Version: 1.2
 #
 # Purpose:
 #   Install, configure, run, update and manage Evolution API on Linux using Docker
@@ -47,7 +47,7 @@ fi
 
 set -uo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 TAG="service-evolution-api"
 
 # -----------------------------------------------------------------------------
@@ -182,6 +182,57 @@ run_elevated() {
     fi
 }
 
+request_destructive_authentication() {
+    local target_name="$1"
+    local prompt_msg="  [AUTENTICAÇÃO] Digite a senha de sudo para autorizar a DESINSTALAÇÃO de ${target_name}: "
+
+    printf '\n'
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        # Running via sudo as root: reset cached credential and prompt invoking user
+        sudo -u "$SUDO_USER" sudo -k 2>/dev/null || true
+        sudo -k 2>/dev/null || true
+        if ! sudo -u "$SUDO_USER" sudo -v -p "$prompt_msg" 2>/dev/null; then
+            if ! sudo -v -p "$prompt_msg"; then
+                err "Autenticação cancelada ou senha incorreta. Operação abortada."
+                exit 1
+            fi
+        fi
+    elif [ "$(id -u)" -ne 0 ]; then
+        # Running as standard user
+        sudo -k 2>/dev/null || true
+        if ! sudo -v -p "$prompt_msg"; then
+            err "Autenticação cancelada ou senha incorreta. Operação abortada."
+            exit 1
+        fi
+    else
+        # Pure root (e.g. direct root shell)
+        if command -v sudo >/dev/null 2>&1; then
+            sudo -k 2>/dev/null || true
+        fi
+    fi
+    return 0
+}
+
+confirm_destructive_action() {
+    local target_name="$1"
+    printf '\n'
+    printf '  %s\n' "${C_RED}${C_BOLD}Confirmação Obrigatória:${C_RESET}"
+    printf '  Para autorizar a destruição e remoção completa de %s,\n' "${C_BOLD}${target_name}${C_RESET}"
+    printf '  digite exatamente %s abaixo:\n\n' "${C_RED}${C_BOLD}UNINSTALL${C_RESET}"
+    printf '  Confirmação: ' > /dev/tty 2>/dev/null || printf '  Confirmação: '
+    local resp=""
+    if [ -r /dev/tty ]; then
+        read -r resp < /dev/tty
+    else
+        read -r resp
+    fi
+    if [ "$resp" != "UNINSTALL" ]; then
+        printf '\n'
+        info "Confirmação cancelada ou palavra incorreta ('$resp'). Nenhuma alteração foi feita."
+        exit 0
+    fi
+}
+
 ask() {
     if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
     local answer
@@ -287,7 +338,7 @@ Management & Lifecycle Actions:
       --update            Safely update Evolution API stack with pre-checks, backup & healthcheck.
       --rollback          Roll back Evolution API stack and configuration to previous state.
       --snapshot-only     Generate pre-update diagnostic runtime state snapshot (.txt).
-      --uninstall         Safely remove the containers and systemd service.
+      --uninstall         Completely purge Evolution API, containers, volumes, database and configs.
 
 General Options:
   -h, --help              Show this help message.
@@ -339,7 +390,7 @@ while [ $# -gt 0 ]; do
         --update)               ACTION="update"; shift ;;
         --rollback)             ACTION="rollback"; shift ;;
         --snapshot-only)        ACTION="snapshot"; shift ;;
-        --uninstall)            ACTION="uninstall"; shift ;;
+        --uninstall|--purge)    ACTION="uninstall"; shift ;;
         -h|--help)              usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
     esac
@@ -1392,48 +1443,80 @@ action_update() {
 
 action_uninstall() {
     print_banner
-    print_section "Evolution API Uninstallation"
+    printf '\n'
+    printf '  %s\n' "${C_RED}████████████████████████████████████████████████████████████${C_RESET}"
+    printf '  %s\n' "${C_RED}${C_BOLD}  [AVISO CRÍTICO] DESINSTALAÇÃO COMPLETA DA EVOLUTION API   ${C_RESET}"
+    printf '  %s\n' "${C_RED}████████████████████████████████████████████████████████████${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "${C_RED}${C_BOLD}ATENÇÃO: ESTA AÇÃO É TOTALMENTE DESTRUTIVA E IRREVERSÍVEL!${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "O que acontecerá ao prosseguir com a desinstalação:"
+    printf '    %s %s\n' "1." "A stack da Evolution API (API, PostgreSQL, Redis) será interrompida e destruída."
+    printf '    %s %s\n' "2." "O serviço do sistema (systemd evolution-api.service) será desativado e removido."
+    printf '    %s %s\n' "3." "TODOS os volumes persistentes do Docker serão DELETADOS permanentemente:"
+    printf '       %s\n' "   • evolution_postgres_data (banco de dados: chats, contatos, mensagens)"
+    printf '       %s\n' "   • evolution_instances (sessões autenticadas do WhatsApp)"
+    printf '       %s\n' "   • evolution_redis_data (cache e filas de mensagens)"
+    printf '       %s\n' "   • evolution_store (armazenamento persistente de arquivos)"
+    printf '    %s %s\n' "4." "A rede isolada do Docker (evolution_net) será excluída."
+    printf '    %s %s\n' "5." "O diretório ${INSTALL_DIR} (.env, docker-compose.yml e chaves) será DELETADO."
+    printf '    %s %s\n' "6." "As imagens Docker locais da Evolution API serão removidas do sistema."
+    printf '\n'
+    warn "Todas as conexões de WhatsApp ativas e dados históricos serão perdidos para sempre!"
 
-    if [ ! -d "$INSTALL_DIR" ]; then
-        err "Installation directory $INSTALL_DIR does not exist."
-        exit 1
-    fi
+    # Solicitar senha do usuário e confirmação explícita
+    request_destructive_authentication "Evolution API"
+    confirm_destructive_action "Evolution API"
 
-    warn "This will stop and remove the Evolution API stack."
-    if ! ask "Are you sure you want to proceed with uninstallation?"; then
-        info "Uninstallation cancelled."
-        exit 0
-    fi
+    print_section "Executando Desinstalação Completa da Evolution API"
+    acquire_lock
 
+    # 1. Parar containers via compose se disponível
     detect_compose || true
     if [ -n "$COMPOSE_CMD" ] && [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
-        info "Stopping and removing containers..."
-        cd "$INSTALL_DIR" && $COMPOSE_CMD down 2>/dev/null || true
+        info "Parando e destruindo stack via docker compose..."
+        cd "$INSTALL_DIR" 2>/dev/null && run_elevated $COMPOSE_CMD down --volumes --remove-orphans 2>/dev/null || true
     fi
 
+    # 2. Forçar remoção de containers remanescentes se houver
+    if command -v docker >/dev/null 2>&1; then
+        info "Removendo quaisquer containers remanescentes da Evolution API..."
+        run_elevated docker rm -f evolution_api evolution_postgres evolution_redis 2>/dev/null || true
+
+        # 3. Remover volumes persistentes
+        info "Deletando volumes Docker persistentes (Postgres, Redis, Instâncias)..."
+        run_elevated docker volume rm evolution_instances evolution_store evolution_postgres_data evolution_redis_data 2>/dev/null || true
+
+        # 4. Remover rede docker
+        info "Removendo rede Docker dedicada..."
+        run_elevated docker network rm evolution_net 2>/dev/null || true
+
+        # 5. Remover imagens Docker da Evolution API
+        info "Removendo imagens Docker associadas..."
+        run_elevated docker rmi -f evoapicloud/evolution-api:latest evoapicloud/evolution-api:v2.2.3 evoapicloud/evolution-api:v2.2.2 2>/dev/null || true
+    fi
+
+    # 6. Desativar e remover serviço systemd
     if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/evolution-api.service" ]; then
-        info "Disabling systemd service..."
+        info "Desativando e removendo serviço systemd (evolution-api.service)..."
         run_elevated systemctl stop evolution-api.service 2>/dev/null || true
         run_elevated systemctl disable evolution-api.service 2>/dev/null || true
         run_elevated rm -f "/etc/systemd/system/evolution-api.service"
         run_elevated systemctl daemon-reload 2>/dev/null || true
-        ok "Removed systemd service."
     fi
 
-    printf '\n'
-    if ask "Do you want to permanently delete all persistent data volumes (database, instances, messages)?"; then
-        if command -v docker >/dev/null 2>&1; then
-            docker volume rm evolution_instances evolution_store evolution_postgres_data evolution_redis_data 2>/dev/null || true
-            ok "Docker persistent volumes removed."
-        fi
+    # 7. Remover diretório de instalação
+    if [ -d "$INSTALL_DIR" ]; then
+        info "Excluindo diretório de instalação e arquivos (.env, configs): ${INSTALL_DIR}..."
         run_elevated rm -rf "$INSTALL_DIR"
-        ok "Removed directory: $INSTALL_DIR"
-    else
-        ok "Persistent Docker volumes preserved. Only configuration files removed."
-        run_elevated rm -f "${INSTALL_DIR}/docker-compose.yml"
     fi
 
-    ok "Evolution API uninstalled successfully."
+    # 8. Limpar manifesto de rollback
+    run_elevated rm -f "${LOG_DIR}/evolution-api-rollback-manifest.env" 2>/dev/null || true
+
+    print_section "Desinstalação Concluída"
+    ok "Evolution API e todos os seus dados, volumes e serviços foram removidos com sucesso."
+    printf '\n'
     exit 0
 }
 

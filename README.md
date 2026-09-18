@@ -24,8 +24,8 @@
 - [🚀 Instalação](#-instalação)
   - [Comando global `inovatils`](#comando-global-inovatils)
   - [Menu interativo (sem o comando global)](#menu-interativo-sem-o-comando-global)
-  - [Comandos do gerenciador](#comandos-do-gerenciador)
   - [Instalação direta (sem menu)](#instalação-direta-sem-menu)
+- [💻 Comandos disponíveis](#-comandos-disponíveis)
 - [📦 Scripts disponíveis](#-scripts-disponíveis)
 - [⚖️ Aviso legal](#️-aviso-legal)
 - [🤝 Contribuindo](#-contribuindo)
@@ -71,6 +71,8 @@ Depois, use `inovatils` de qualquer lugar:
 ```bash
 inovatils                  # abre o menu interativo
 inovatils list             # lista scripts + status/versões
+inovatils install          # instala todos os scripts disponíveis (atalho: inovatils i)
+inovatils uninstall        # desinstala todos os scripts (atalho: inovatils u)
 inovatils update           # atualiza todos os instalados
 inovatils self-update      # atualiza o próprio inovatils + gerenciador
 inovatils --help
@@ -88,23 +90,6 @@ Baixe o gerenciador e abra o menu:
 curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh -o /tmp/install.sh
 sudo bash /tmp/install.sh
 ```
-
-### Comandos do gerenciador
-
-```bash
-sudo bash /tmp/install.sh list                    # lista scripts + status/versões
-inovatils list                                     # idem via comando global
-sudo bash /tmp/install.sh install docker-cleanup.sh
-sudo bash /tmp/install.sh update                  # atualiza todos os instalados
-sudo bash /tmp/install.sh update threat-scan.sh   # atualiza um script
-sudo bash /tmp/install.sh remove threat-scan.sh
-sudo bash /tmp/install.sh self-update             # atualiza o próprio gerenciador
-inovatils self-update                              # atualiza gerenciador + comando global
-```
-
-> O gerenciador detecta automaticamente quando há uma nova versão dele mesmo,
-> mostra a versão atual, a versão remota e as últimas mudanças (do git), e
-> pergunta se deseja atualizar.
 
 ### Instalação direta (sem menu)
 
@@ -129,19 +114,34 @@ curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/inst
 > ℹ️ Os scripts são instalados em `/usr/local/sbin` (que exige privilégios de
 > root, daí o `sudo`). Sempre revise o conteúdo antes de executar.
 
+## 💻 Comandos disponíveis
+
+| Comando                        | Descrição                                                                                        | Alias / Atalho                                             | Exemplo                                    |
+| ------------------------------ | ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------- | ------------------------------------------ |
+| `inovatils`                    | Abre o menu interativo com interface no terminal (TUI) para gerenciar e executar scripts.        | —                                                          | `inovatils`                                |
+| `inovatils list`               | Lista todos os utilitários do repositório exibindo versões local, remota e status de instalação. | `inovatils status`                                         | `inovatils list`                           |
+| `inovatils install`            | Baixa e instala todos os scripts disponíveis do repositório em `/usr/local/sbin/`.              | `inovatils i`                                              | `inovatils install` *(ou `inovatils i`)*   |
+| `inovatils install <script>`   | Baixa e instala o script informado em `/usr/local/sbin/` com permissão de execução.              | `inovatils i <script>`, `inovatils <script>`               | `inovatils install service-docker`         |
+| `inovatils uninstall`          | Desinstala e remove todos os scripts instalados do sistema.                                      | `inovatils u`                                              | `inovatils uninstall` *(ou `inovatils u`)* |
+| `inovatils uninstall <script>` | Remove e desinstala o script indicado do sistema.                                                | `inovatils u <script>`, `inovatils remove`, `inovatils rm` | `inovatils uninstall disk-health.sh`       |
+| `inovatils update`             | Percorre e atualiza automaticamente todos os scripts atualmente instalados no sistema.           | —                                                          | `inovatils update`                         |
+| `inovatils update <script>`    | Atualiza um script específico instalado para a versão mais recente publicada no repositório.     | —                                                          | `inovatils update service-docker`          |
+| `inovatils self-update`        | Atualiza o próprio executável `inovatils` e o gerenciador local para a versão mais recente.      | —                                                          | `inovatils self-update`                    |
+| `inovatils --help`             | Exibe o manual de ajuda detalhado com os comandos e parâmetros aceitos.                          | `inovatils -h`                                             | `inovatils --help`                         |
+
 ## 📦 Scripts disponíveis
 
-| Script                                                         | Descrição                                                                                                                                                                                                 | Plataformas                              | Instalação                                                                                                                              |
-| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| [`docker-cleanup.sh`](./docker-cleanup.sh)                     | Limpeza automática de imagens, containers parados, redes não utilizadas e cache de build do Docker, preservando sempre os volumes.                                                                        | Linux · macOS · Windows (Docker Desktop) | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- docker-cleanup.sh`           |
-| [`sys-update-checker.sh`](./sys-update-checker.sh)             | Analisa pacotes, kernel e serviços que precisam de atualização e aplica as atualizações de forma segura após aceite (modo interativo ou `--yes`).                                                         | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- sys-update-checker.sh`       |
-| [`threat-scan.sh`](./threat-scan.sh)                           | Varredura somente-leitura que identifica indícios de vírus, worms, malwares, mineradores, backdoors e persistências suspeitas (processos, rede, agendamentos, usuários, arquivos, kernel).                | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- threat-scan.sh`              |
-| [`disk-health.sh`](./disk-health.sh)                           | Diagnóstico de disco, inodes e crescimento de logs; oferece limpezas seguras de journal, logs rotacionados e arquivos temporários antigos, reportando espaço reclamável do Docker.                        | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- disk-health.sh`              |
-| [`opencode-installer.sh`](./opencode-installer.sh)             | Baixa e instala o OpenCode (AI coding agent) pelo melhor método da plataforma (script oficial, Homebrew, npm, Chocolatey, Scoop, pacman).                                                                 | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- opencode-installer.sh`       |
-| [`service-docker`](./service-docker)                           | Instalação e atualização segura do Docker Engine e Compose V2 para a última versão estável, com pré-checagens, snapshot (.txt), backup e rollback automático/manual (`--rollback`) de versões e projetos. | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- service-docker`            |
-| [`service-evolution-api`](./service-evolution-api)             | Instalação, atualização segura (`--update`) e ciclo de vida da Evolution API v2 em Linux via Docker Compose, com backup automático, rollback, persistência e segurança.                                | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- service-evolution-api`      |
-| [`install.sh`](./install.sh)                                   | Gerenciador/instalador: baixa, rastreia versões, atualiza e remove os scripts, com menu interativo e comandos de linha.                                                                                   | Linux · macOS · Windows                  | —                                                                                                                                       |
-| [`inovatils`](./inovatils)                                     | Comando global (wrapper) para o gerenciador — chamável de qualquer diretório (`inovatils list`, `inovatils update`, ...).                                                                                 | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- inovatils`                   |
+| Script                                             | Descrição                                                                                                                                                                                  | Plataformas                              | Instalação                                                                                                                        |
+| -------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| [`docker-cleanup.sh`](./docker-cleanup.sh)         | Limpeza automática de imagens, containers parados, redes não utilizadas e cache de build do Docker, preservando sempre os volumes.                                                         | Linux · macOS · Windows (Docker Desktop) | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- docker-cleanup.sh`     |
+| [`sys-update-checker.sh`](./sys-update-checker.sh) | Analisa pacotes, kernel e serviços que precisam de atualização e aplica as atualizações de forma segura após aceite (modo interativo ou `--yes`).                                          | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- sys-update-checker.sh` |
+| [`threat-scan.sh`](./threat-scan.sh)               | Varredura somente-leitura que identifica indícios de vírus, worms, malwares, mineradores, backdoors e persistências suspeitas (processos, rede, agendamentos, usuários, arquivos, kernel). | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- threat-scan.sh`        |
+| [`disk-health.sh`](./disk-health.sh)               | Diagnóstico de disco, inodes e crescimento de logs; oferece limpezas seguras de journal, logs rotacionados e arquivos temporários antigos, reportando espaço reclamável do Docker.         | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- disk-health.sh`        |
+| [`opencode-installer.sh`](./opencode-installer.sh) | Baixa e instala o OpenCode (AI coding agent) pelo melhor método da plataforma (script oficial, Homebrew, npm, Chocolatey, Scoop, pacman).                                                  | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- opencode-installer.sh` |
+| [`service-docker`](./service-docker)               | Instalação e atualização segura do Docker Engine e Compose V2 (com rollback `--rollback`) e desinstalação/purga profunda do sistema (`--uninstall`).                                       | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- service-docker`        |
+| [`service-evolution-api`](./service-evolution-api) | Instalação, atualização segura (`--update`), ciclo de vida e desinstalação/purga profunda de dados e volumes (`--uninstall`) da Evolution API v2 em Linux.                                 | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- service-evolution-api` |
+| [`install.sh`](./install.sh)                       | Gerenciador/instalador: baixa, rastreia versões, atualiza e remove os scripts, com menu interativo e comandos de linha.                                                                    | Linux · macOS · Windows                  | —                                                                                                                                 |
+| [`inovatils`](./inovatils)                         | Comando global (wrapper) para o gerenciador — chamável de qualquer diretório (`inovatils list`, `inovatils update`, ...).                                                                  | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- inovatils`             |
 
 ## ⚖️ Aviso legal
 
