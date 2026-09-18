@@ -1,10 +1,10 @@
 #!/bin/bash
 
 # ==============================================================================
-# Docker Engine & Compose — Automated Installer & Safe Updater
+# Docker Engine & Compose — Automated Service Installer & Safe Updater
 #
 # Maintainer: Inova e-Business
-# Version: 1.1
+# Version: 1.2
 #
 # Purpose:
 #   Install and safely update Docker Engine and Docker Compose V2 to the latest
@@ -47,15 +47,15 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
     else
-        echo "ERROR: installer-updater-docker requires Bash. Please run: sudo bash $0" >&2
+        echo "ERROR: service-docker requires Bash. Please run: sudo bash $0" >&2
         exit 1
     fi
 fi
 
 set -uo pipefail
 
-VERSION="1.1"
-TAG="installer-updater-docker"
+VERSION="1.2"
+TAG="service-docker"
 
 # -----------------------------------------------------------------------------
 # Options & Defaults
@@ -100,12 +100,12 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null || [ ! -w "$LOG_DIR" ]; then
     LOG_DIR="${TMPDIR:-/tmp}/inova-devops"
     mkdir -p "$LOG_DIR" 2>/dev/null || true
 fi
-LOG_FILE="${LOG_DIR}/docker-installer-updater-${START_TS}.log"
+LOG_FILE="${LOG_DIR}/service-docker-${START_TS}.log"
 if touch "$LOG_FILE" 2>/dev/null; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
 
-LATEST_MANIFEST="${LOG_DIR}/docker-rollback-manifest.env"
+LATEST_MANIFEST="${LOG_DIR}/service-docker-rollback-manifest.env"
 
 _spin() {
     local pid="$1" label="$2" i=0 n=${#SPIN_FRAMES[@]}
@@ -142,7 +142,7 @@ run_spinner() {
 # -----------------------------------------------------------------------------
 # Lock Management
 # -----------------------------------------------------------------------------
-LOCK_DIR="${TMPDIR:-/tmp}/installer-updater-docker.lock"
+LOCK_DIR="${TMPDIR:-/tmp}/service-docker.lock"
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
         err "Another Docker installer/updater process is currently running."
@@ -181,7 +181,7 @@ ask() {
 print_banner() {
     printf '\n'
     printf '  %s\n' '============================================================'
-    printf '  %s\n' '  DOCKER ENGINE & COMPOSE — INSTALLER & SAFE UPDATER'
+    printf '  %s\n' '  DOCKER ENGINE & COMPOSE — SERVICE INSTALLER & SAFE UPDATER'
     printf '  %s\n' '  Maintainer: Inova e-Business'
     printf '  %s\n' "  Version: $VERSION"
     printf '  %s\n' '============================================================'
@@ -206,6 +206,7 @@ Usage: $0 [OPTIONS]
 Options:
   -y, --yes               Install or update without asking for confirmation.
   -c, --check-only        Run all pre-flight checks and report versions without changes.
+      --update            Run safe update of Docker Engine & Docker Compose.
       --rollback          Roll back to the previous Docker & Compose version and restore state.
       --snapshot-only     Only generate the pre-update runtime state snapshot (.txt).
       --status            Show current Docker installation status, compose stacks and workload.
@@ -214,6 +215,7 @@ Options:
 Examples:
   $0                      Interactive check, snapshot, and install/update
   $0 -y                   Automated unattended install/update with safety snapshots
+  $0 --update             Explicitly run the safe update workflow
   $0 -c                   Check compatibility, locks, and versions only
   $0 --rollback           Restore previous Docker version, configuration and containers
   $0 --snapshot-only      Generate a complete diagnostic snapshot of Docker resources
@@ -225,6 +227,29 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -y|--yes)           ASSUME_YES=1; shift ;;
         -c|--check-only)    CHECK_ONLY=1; ACTION="check"; shift ;;
+        --update)           ACTION="run"; shift ;;
+        --apiKey|--apikey)
+            if [ -f "/opt/evolution-api/.env" ]; then
+                local evo_key evo_url evo_port
+                evo_key="$(grep -E '^AUTHENTICATION_API_KEY=' /opt/evolution-api/.env 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+                evo_url="$(grep -E '^SERVER_URL=' /opt/evolution-api/.env 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "unknown")"
+                evo_port="$(grep -E '^SERVER_PORT=' /opt/evolution-api/.env 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "8080")"
+                if [ -n "$evo_key" ]; then
+                    print_banner
+                    print_section "Evolution API Global Key"
+                    printf '    %s %s\n' "API URL    :" "${C_CYAN}${evo_url}${C_RESET}"
+                    printf '    %s %s\n' "HTTP Port  :" "${C_CYAN}${evo_port}${C_RESET}"
+                    printf '\n'
+                    printf '  %s\n' "${C_BOLD}Global Authentication API Key:${C_RESET}"
+                    printf '    %s\n\n' "${C_YELLOW}${C_BOLD}${evo_key}${C_RESET}"
+                    info "Note: Evolution API is managed primarily via: service-evolution-api --apiKey"
+                    exit 0
+                fi
+            fi
+            err "Evolution API installation not found at /opt/evolution-api."
+            info "For Evolution API management, please use: service-evolution-api --apiKey"
+            exit 1
+            ;;
         --rollback)         ACTION="rollback"; shift ;;
         --snapshot-only)    SNAPSHOT_ONLY=1; ACTION="snapshot"; shift ;;
         --status)           ACTION="status"; shift ;;
@@ -505,7 +530,7 @@ generate_pre_update_snapshot() {
     {
         printf '%s\n' '==============================================================================='
         printf '%s\n' 'DOCKER PRE-UPDATE STATE SNAPSHOT'
-        printf 'Generated by: Inova DevOps Utilities (installer-updater-docker.sh)\n'
+        printf 'Generated by: Inova DevOps Utilities (service-docker)\n'
         printf 'Timestamp   : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
         printf 'Hostname    : %s\n' "$(hostname 2>/dev/null || uname -n)"
         printf 'Kernel      : %s\n' "$(uname -a)"
@@ -1137,7 +1162,7 @@ action_main() {
     info "If any unexpected issue arises, you can roll back at any time with:"
     printf '    %s\n' "${C_BOLD}sudo bash $0 --rollback${C_RESET}"
     printf '\n'
-    log "Docker installer/updater completed. Maintainer: Inova e-Business"
+    log "Docker service completed. Maintainer: Inova e-Business"
     printf '\n'
 }
 

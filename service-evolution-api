@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # ==============================================================================
-# Evolution API Installer & Lifecycle Manager
+# Evolution API Service — Installer, Safe Updater & Lifecycle Manager
 #
 # Maintainer: Inova e-Business
-# Version: 1.0
+# Version: 1.1
 #
 # Purpose:
-#   Install, configure, run and manage Evolution API on Linux using Docker and
-#   Docker Compose with persistence, security hardening and production best
-#   practices.
+#   Install, configure, run, update and manage Evolution API on Linux using Docker
+#   and Docker Compose with persistence, security hardening, diagnostic snapshots,
+#   automatic backups and safe rollback capabilities.
 #
 # Supported platforms:
 #   - Linux   : Ubuntu, Debian, CentOS, RHEL, Rocky Linux, AlmaLinux, Fedora, Arch
@@ -40,15 +40,15 @@ if [ -z "${BASH_VERSION:-}" ]; then
     if command -v bash >/dev/null 2>&1; then
         exec bash "$0" "$@"
     else
-        echo "ERROR: Evolution API installer requires Bash. Please install bash and run: sudo bash $0" >&2
+        echo "ERROR: service-evolution-api requires Bash. Please install bash and run: sudo bash $0" >&2
         exit 1
     fi
 fi
 
 set -uo pipefail
 
-VERSION="1.0"
-TAG="evolution-api-installer"
+VERSION="1.1"
+TAG="service-evolution-api"
 
 # -----------------------------------------------------------------------------
 # Default Configuration
@@ -115,10 +115,13 @@ if ! mkdir -p "$LOG_DIR" 2>/dev/null || [ ! -w "$LOG_DIR" ]; then
     LOG_DIR="${TMPDIR:-/tmp}/inova-devops"
     mkdir -p "$LOG_DIR" 2>/dev/null || true
 fi
-LOG_FILE="${LOG_DIR}/evolution-api-install-${START_TS}.log"
+LOG_FILE="${LOG_DIR}/service-evolution-api-${START_TS}.log"
 if touch "$LOG_FILE" 2>/dev/null; then
     exec > >(tee -a "$LOG_FILE") 2>&1
 fi
+
+LATEST_MANIFEST="${LOG_DIR}/evolution-api-rollback-manifest.env"
+LATEST_BACKUP_FILE="" 
 
 _spin() {
     local pid="$1" label="$2" i=0 n=${#SPIN_FRAMES[@]}
@@ -155,10 +158,10 @@ run_spinner() {
 # -----------------------------------------------------------------------------
 # Lock Management (portable mkdir-based lock)
 # -----------------------------------------------------------------------------
-LOCK_DIR="${TMPDIR:-/tmp}/evolution-api-installer.lock"
+LOCK_DIR="${TMPDIR:-/tmp}/service-evolution-api.lock"
 acquire_lock() {
     if ! mkdir "$LOCK_DIR" 2>/dev/null; then
-        err "Another Evolution API installer process is currently running."
+        err "Another Evolution API service process is currently running."
         exit 1
     fi
     trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
@@ -241,7 +244,7 @@ detect_server_url() {
 print_banner() {
     printf '\n'
     printf '  %s\n' '============================================================'
-    printf '  %s\n' '  EVOLUTION API — INSTALLER & LIFECYCLE MANAGER'
+    printf '  %s\n' '  EVOLUTION API — SERVICE INSTALLER, SAFE UPDATER & MANAGER'
     printf '  %s\n' '  Maintainer: Inova e-Business'
     printf '  %s\n' "  Version: $VERSION"
     printf '  %s\n' '============================================================'
@@ -264,7 +267,7 @@ usage() {
 Usage: $0 [OPTIONS]
 
 Installation Options:
-  -y, --yes               Install using defaults and generated secure keys without prompts.
+  -y, --yes               Install or update using defaults without prompts.
   -c, --check-only        Run system pre-flight checks only (no changes).
       --dir PATH          Installation directory (default: /opt/evolution-api).
       --port PORT         HTTP port to bind (default: 8080).
@@ -273,13 +276,17 @@ Installation Options:
       --image IMAGE       Evolution API Docker image (default: evoapicloud/evolution-api:latest).
       --no-systemd        Do not install systemd service unit.
 
-Management Actions:
+Management & Lifecycle Actions:
       --status            Check status and health of the Evolution API stack.
+      --apiKey            Display the global authentication API key for verification.
       --start             Start the Evolution API stack.
       --stop              Stop the Evolution API stack (preserves volumes).
       --restart           Restart all Evolution API containers.
       --logs              View live logs from all containers.
       --backup            Create an archive backup of config, database and instances.
+      --update            Safely update Evolution API stack with pre-checks, backup & healthcheck.
+      --rollback          Roll back Evolution API stack and configuration to previous state.
+      --snapshot-only     Generate pre-update diagnostic runtime state snapshot (.txt).
       --uninstall         Safely remove the containers and systemd service.
 
 General Options:
@@ -288,6 +295,9 @@ General Options:
 Examples:
   $0                      Interactive installation wizard
   $0 -y                   Unattended automatic installation with secure defaults
+  $0 --apiKey             Display the configured Global API Key
+  $0 --update             Safe update with pre-checks, snapshot, backup and healthcheck
+  $0 --rollback           Roll back to the previous Evolution API image and configuration
   $0 -c                   Check prerequisites without modifying the system
   $0 --status             Check status of running Evolution API stack
   $0 --logs               Stream logs from Evolution API containers
@@ -306,7 +316,14 @@ while [ $# -gt 0 ]; do
         --dir=*)                INSTALL_DIR="${1#*=}"; shift ;;
         --port)                 EVOLUTION_PORT="$2"; shift 2 ;;
         --port=*)               EVOLUTION_PORT="${1#*=}"; shift ;;
-        --api-key)              AUTHENTICATION_API_KEY="$2"; shift 2 ;;
+        --apiKey|--apikey)      ACTION="apikey"; shift ;;
+        --api-key)
+            if [ $# -ge 2 ] && [[ "$2" != --* ]]; then
+                AUTHENTICATION_API_KEY="$2"; shift 2
+            else
+                ACTION="apikey"; shift
+            fi
+            ;;
         --api-key=*)            AUTHENTICATION_API_KEY="${1#*=}"; shift ;;
         --server-url)           SERVER_URL="$2"; shift 2 ;;
         --server-url=*)         SERVER_URL="${1#*=}"; shift ;;
@@ -319,6 +336,9 @@ while [ $# -gt 0 ]; do
         --restart)              ACTION="restart"; shift ;;
         --logs)                 ACTION="logs"; shift ;;
         --backup)               ACTION="backup"; shift ;;
+        --update)               ACTION="update"; shift ;;
+        --rollback)             ACTION="rollback"; shift ;;
+        --snapshot-only)        ACTION="snapshot"; shift ;;
         --uninstall)            ACTION="uninstall"; shift ;;
         -h|--help)              usage; exit 0 ;;
         *) err "Unknown option: $1"; usage; exit 1 ;;
@@ -431,8 +451,8 @@ ensure_docker_environment() {
         err "Docker Engine is not installed on this system."
         info "Evolution API requires Docker Engine to run in persistent production mode."
         info "Please install Docker first using the dedicated utility:"
-        printf '    %s\n' "sudo bash ./installer-updater-docker.sh"
-        info "Or via inovatils: inovatils installer-updater-docker.sh"
+        printf '    %s\n' "sudo bash ./service-docker"
+        info "Or via inovatils: inovatils service-docker"
         return 1
     fi
 
@@ -456,7 +476,7 @@ ensure_docker_environment() {
     else
         err "Docker Compose V2 plugin was not found."
         info "Please install or update Docker Compose using:"
-        printf '    %s\n' "sudo bash ./installer-updater-docker.sh"
+        printf '    %s\n' "sudo bash ./service-docker"
         return 1
     fi
     return 0
@@ -490,6 +510,10 @@ generate_configuration_files() {
     if [ -f "$env_file" ]; then
         warn "Existing .env found at $env_file. Backing up to ${env_file}.bak"
         cp "$env_file" "${env_file}.bak"
+        [ -z "$AUTHENTICATION_API_KEY" ] && AUTHENTICATION_API_KEY="$(grep -E '^AUTHENTICATION_API_KEY=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+        [ -z "$POSTGRES_PASSWORD" ] && POSTGRES_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+        [ -z "$REDIS_PASSWORD" ] && REDIS_PASSWORD="$(grep -E '^REDIS_PASSWORD=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+        [ -z "$SERVER_URL" ] && SERVER_URL="$(grep -E '^SERVER_URL=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
     fi
 
     info "Writing environment file (.env)..."
@@ -838,6 +862,36 @@ action_status() {
     exit 0
 }
 
+action_apikey() {
+    print_banner
+    print_section "Evolution API Global Key"
+
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/.env" ]; then
+        err "No Evolution API installation or .env found at $INSTALL_DIR."
+        exit 1
+    fi
+
+    local key url port
+    key="$(grep -E '^AUTHENTICATION_API_KEY=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+    url="$(grep -E '^SERVER_URL=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "unknown")"
+    port="$(grep -E '^SERVER_PORT=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "$DEFAULT_PORT")"
+
+    if [ -z "$key" ]; then
+        err "AUTHENTICATION_API_KEY was not found in ${INSTALL_DIR}/.env."
+        exit 1
+    fi
+
+    info "Configuration Details:"
+    printf '    %s %s\n' "API URL    :" "${C_CYAN}${url}${C_RESET}"
+    printf '    %s %s\n' "HTTP Port  :" "${C_CYAN}${port}${C_RESET}"
+    printf '    %s %s\n' "Docs URL   :" "${C_CYAN}${url}/docs${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "${C_BOLD}Global Authentication API Key:${C_RESET}"
+    printf '    %s\n' "${C_YELLOW}${C_BOLD}${key}${C_RESET}"
+    printf '\n'
+    exit 0
+}
+
 action_start() {
     print_banner
     info "Starting Evolution API stack at $INSTALL_DIR..."
@@ -891,17 +945,7 @@ action_logs() {
     exec $COMPOSE_CMD logs -f --tail=100
 }
 
-action_backup() {
-    print_banner
-    print_section "Evolution API Backup"
-
-    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
-        err "No Evolution API installation found at $INSTALL_DIR."
-        exit 1
-    fi
-    detect_compose || { err "Docker Compose is required."; exit 1; }
-    cd "$INSTALL_DIR" || exit 1
-
+create_backup() {
     local backup_dir="${INSTALL_DIR}/backups"
     mkdir -p "$backup_dir"
 
@@ -912,12 +956,12 @@ action_backup() {
 
     # Extract database credentials from .env
     local db_user db_name db_pass
-    db_user="$(grep -E '^POSTGRES_USER=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
-    db_name="$(grep -E '^POSTGRES_DB=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
-    db_pass="$(grep -E '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "")"
+    db_user="$(grep -E '^POSTGRES_USER=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+    db_name="$(grep -E '^POSTGRES_DB=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+    db_pass="$(grep -E '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "")"
 
     info "Exporting PostgreSQL database..."
-    if docker ps --format '{{.Names}}' | grep -q "^evolution_postgres$"; then
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^evolution_postgres$"; then
         if docker exec -e PGPASSWORD="$db_pass" evolution_postgres pg_dump -U "$db_user" "$db_name" > "$db_dump" 2>/dev/null; then
             ok "Database dumped to $db_dump"
         else
@@ -925,7 +969,7 @@ action_backup() {
             rm -f "$db_dump"
         fi
     else
-        warn "evolution_postgres container is not running; skipping database dump."
+        warn "evolution_postgres container is not running; skipping live database dump."
     fi
 
     # Backup instances volume using a temporary alpine container
@@ -947,12 +991,402 @@ action_backup() {
     rm -f "$db_dump" "$instances_tar"
 
     if [ -f "$b_file" ]; then
+        chmod 600 "$b_file" 2>/dev/null || true
+        LATEST_BACKUP_FILE="$b_file"
         ok "Backup created successfully: $b_file"
         info "Archive contains: .env, docker-compose.yml, PostgreSQL database dump, and WhatsApp session instances."
+        return 0
     else
         err "Backup creation failed."
+        return 1
+    fi
+}
+
+action_backup() {
+    print_banner
+    print_section "Evolution API Backup"
+
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
         exit 1
     fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+
+    create_backup || exit 1
+    exit 0
+}
+
+generate_pre_update_snapshot() {
+    print_section "Evolution API Pre-Update Snapshot"
+
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        return 1
+    fi
+
+    local snap_file="${LOG_DIR}/evolution-api-pre-update-${START_TS}.txt"
+    info "Collecting diagnostic runtime snapshot..."
+
+    cd "$INSTALL_DIR" || return 1
+
+    {
+        printf '%s\n' '==============================================================================='
+        printf '%s\n' 'EVOLUTION API PRE-UPDATE STATE SNAPSHOT'
+        printf 'Generated by: Inova DevOps Utilities (service-evolution-api)\n'
+        printf 'Timestamp   : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf 'Hostname    : %s\n' "$(hostname 2>/dev/null || uname -n)"
+        printf 'Kernel      : %s\n' "$(uname -a)"
+        printf 'Install Dir : %s\n' "$INSTALL_DIR"
+        printf '%s\n\n' '==============================================================================='
+
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '1. SYSTEM RESOURCES'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        free -m 2>&1 || true
+        printf '\nDisk Space:\n'
+        df -h "$INSTALL_DIR" 2>&1 || true
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '2. DOCKER & DOCKER COMPOSE VERSIONS'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        docker --version 2>&1 || true
+        $COMPOSE_CMD version 2>&1 || true
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '3. EVOLUTION API STACK STATUS (docker compose ps)'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        $COMPOSE_CMD ps 2>&1 || true
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '4. CONTAINER IMAGES & DIGESTS'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        for cname in evolution_api evolution_postgres evolution_redis; do
+            if docker ps -a --format '{{.Names}}' | grep -q "^${cname}$"; then
+                printf 'Container: %s\n' "$cname"
+                docker inspect --format '  Image: {{.Config.Image}} (ID: {{.Image}})' "$cname" 2>&1 || true
+                docker inspect --format '  Created: {{.Created}} | Status: {{.State.Status}}' "$cname" 2>&1 || true
+            fi
+        done
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '5. DOCKER PERSISTENT VOLUMES'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        docker volume ls --filter name=evolution 2>&1 || true
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '6. DOCKER NETWORK'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        docker network ls --filter name=evolution-net 2>&1 || true
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '7. ENVIRONMENT CONFIGURATION (.env with redacted secrets)'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        if [ -f "${INSTALL_DIR}/.env" ]; then
+            sed -E 's/(API_KEY|PASSWORD|SECRET)=.*/\1=********/' "${INSTALL_DIR}/.env" 2>&1 || true
+        else
+            printf '.env file not found.\n'
+        fi
+    } > "$snap_file"
+
+    chmod 640 "$snap_file" 2>/dev/null || true
+    ok "Pre-update state snapshot saved: ${snap_file}"
+    return 0
+}
+
+create_rollback_manifest() {
+    local prev_image="$1"
+    local prev_env_bak="$2"
+    local prev_compose_bak="$3"
+    local backup_tar="$4"
+    local snap_file="$5"
+    local manifest_file="${INSTALL_DIR}/backups/rollback-manifest-${START_TS}.env"
+
+    cat <<EOF > "$manifest_file"
+# Evolution API Rollback Manifest
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+INSTALL_DIR="${INSTALL_DIR}"
+PREV_IMAGE="${prev_image}"
+PREV_ENV_BACKUP="${prev_env_bak}"
+PREV_COMPOSE_BACKUP="${prev_compose_bak}"
+BACKUP_ARCHIVE="${backup_tar}"
+SNAPSHOT_FILE="${snap_file}"
+PORT="${EVOLUTION_PORT}"
+EOF
+
+    chmod 600 "$manifest_file" 2>/dev/null || true
+    cp "$manifest_file" "$LATEST_MANIFEST" 2>/dev/null || true
+    ok "Rollback manifest saved: $manifest_file"
+}
+
+perform_rollback() {
+    print_banner
+    print_section "Evolution API Rollback"
+
+    local manifest=""
+    if [ -f "$LATEST_MANIFEST" ]; then
+        manifest="$LATEST_MANIFEST"
+    elif [ -d "${INSTALL_DIR}/backups" ]; then
+        manifest="$(ls -t "${INSTALL_DIR}/backups"/rollback-manifest-*.env 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        err "No rollback manifest found. Cannot perform automated rollback."
+        info "You can manually restore your config and database from ${INSTALL_DIR}/backups/"
+        exit 1
+    fi
+
+    info "Loading rollback manifest: $manifest"
+    # shellcheck disable=SC1090
+    . "$manifest"
+
+    info "Previous Configuration:"
+    printf '    %s %s\n' "Install Dir   :" "$INSTALL_DIR"
+    printf '    %s %s\n' "Previous Image:" "${PREV_IMAGE:-unknown}"
+    printf '    %s %s\n' "Backup Archive:" "${BACKUP_ARCHIVE:-none}"
+
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        if ! ask "Restore Evolution API to this previous configuration state?"; then
+            warn "Rollback cancelled by user."
+            exit 0
+        fi
+    fi
+
+    cd "$INSTALL_DIR" || exit 1
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+
+    # Restore .env and docker-compose.yml
+    if [ -n "${PREV_ENV_BACKUP:-}" ] && [ -f "$PREV_ENV_BACKUP" ]; then
+        info "Restoring .env from $PREV_ENV_BACKUP..."
+        cp "$PREV_ENV_BACKUP" "${INSTALL_DIR}/.env"
+        chmod 600 "${INSTALL_DIR}/.env"
+    fi
+    if [ -n "${PREV_COMPOSE_BACKUP:-}" ] && [ -f "$PREV_COMPOSE_BACKUP" ]; then
+        info "Restoring docker-compose.yml from $PREV_COMPOSE_BACKUP..."
+        cp "$PREV_COMPOSE_BACKUP" "${INSTALL_DIR}/docker-compose.yml"
+        chmod 644 "${INSTALL_DIR}/docker-compose.yml"
+    fi
+
+    # Redeploy previous container image
+    info "Redeploying stack with previous configuration..."
+    $COMPOSE_CMD up -d --remove-orphans
+
+    # Optional restore of database if needed
+    if [ -n "${BACKUP_ARCHIVE:-}" ] && [ -f "$BACKUP_ARCHIVE" ]; then
+        if ask "Do you also want to restore the PostgreSQL database from the backup archive?"; then
+            info "Extracting database dump from archive..."
+            local tmp_restore
+            tmp_restore="$(mktemp -d)"
+            tar -xzf "$BACKUP_ARCHIVE" -C "$tmp_restore" 2>/dev/null || true
+            local dump_sql
+            dump_sql="$(ls "$tmp_restore"/evolution-db-*.sql 2>/dev/null | head -n1 || true)"
+            if [ -n "$dump_sql" ] && [ -f "$dump_sql" ]; then
+                local db_user db_name db_pass
+                db_user="$(grep -E '^POSTGRES_USER=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+                db_name="$(grep -E '^POSTGRES_DB=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+                db_pass="$(grep -E '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "")"
+                info "Restoring PostgreSQL database..."
+                docker exec -i -e PGPASSWORD="$db_pass" evolution_postgres psql -U "$db_user" "$db_name" < "$dump_sql" 2>/dev/null || warn "Database restore encountered warnings."
+                ok "Database restore applied."
+            fi
+            rm -rf "$tmp_restore"
+        fi
+    fi
+
+    # Verify health
+    info "Verifying health after rollback..."
+    local cur_port
+    cur_port="$(grep -E '^SERVER_PORT=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2 | tr -d ' ' || echo "${PORT:-8080}")"
+    sleep 5
+    if curl -sf --max-time 3 "http://localhost:${cur_port}/" >/dev/null 2>&1; then
+        ok "Evolution API is responding normally after rollback!"
+    else
+        warn "Evolution API container restarted, but HTTP response not yet 200. Check logs with: $0 --logs"
+    fi
+
+    ok "Rollback execution completed."
+    exit 0
+}
+
+action_snapshot() {
+    print_banner
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    generate_pre_update_snapshot
+    exit 0
+}
+
+action_update() {
+    acquire_lock
+    print_banner
+    print_section "Evolution API Safe Update"
+
+    # 1. Verify existing installation
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ] || [ ! -f "${INSTALL_DIR}/.env" ]; then
+        err "Evolution API is not installed at ${INSTALL_DIR}."
+        err "Cannot update a non-existent installation."
+        info "To perform a new installation, run: $0 (or $0 -y)"
+        exit 1
+    fi
+
+    # 2. Prerequisites & checks
+    check_platform || exit 1
+    check_system_resources
+    ensure_docker_environment || exit 1
+
+    cd "$INSTALL_DIR" || exit 1
+
+    # 3. Read and preserve current environment
+    local cur_image cur_port cur_url
+    cur_image="$(grep -E '^EVOLUTION_IMAGE=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "$DEFAULT_IMAGE")"
+    [ -z "$cur_image" ] && cur_image="$DEFAULT_IMAGE"
+    cur_port="$(grep -E '^SERVER_PORT=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "$DEFAULT_PORT")"
+    cur_url="$(grep -E '^SERVER_URL=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "unknown")"
+    EVOLUTION_PORT="$cur_port"
+
+    # Target image
+    local target_image="$cur_image"
+    if [ -n "$EVOLUTION_IMAGE" ] && [ "$EVOLUTION_IMAGE" != "$DEFAULT_IMAGE" ]; then
+        target_image="$EVOLUTION_IMAGE"
+    fi
+
+    info "Current Installation Details:"
+    printf '    %s %s\n' "Install Directory :" "$INSTALL_DIR"
+    printf '    %s %s\n' "Current Image     :" "$cur_image"
+    printf '    %s %s\n' "Target Image      :" "$target_image"
+    printf '    %s %s\n' "Configured Port   :" "$cur_port"
+    printf '    %s %s\n' "Configured URL    :" "$cur_url"
+
+    # Interactive confirmation
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        printf '\n'
+        if [ "$target_image" = "$cur_image" ]; then
+            info "Update will pull the latest layer for '${target_image}' and restart containers."
+        else
+            info "Update will switch image to '${target_image}', pull and restart containers."
+        fi
+        if ! ask "Proceed with safe update of Evolution API?"; then
+            warn "Update cancelled by user."
+            exit 0
+        fi
+    fi
+
+    # 4. Generate pre-update state snapshot (.txt)
+    local snap_file="${LOG_DIR}/evolution-api-pre-update-${START_TS}.txt"
+    generate_pre_update_snapshot
+
+    # 5. Backup database, instances, and config files
+    info "Performing safety backup before updating..."
+    if ! create_backup; then
+        err "Safety backup failed. Aborting update to prevent potential data loss."
+        exit 1
+    fi
+
+    # Backup current .env and docker-compose.yml files specifically
+    local env_bak="${INSTALL_DIR}/backups/.env.pre-update-${START_TS}"
+    local compose_bak="${INSTALL_DIR}/backups/docker-compose.yml.pre-update-${START_TS}"
+    cp "${INSTALL_DIR}/.env" "$env_bak"
+    cp "${INSTALL_DIR}/docker-compose.yml" "$compose_bak"
+
+    # 6. Save rollback manifest
+    create_rollback_manifest "$cur_image" "$env_bak" "$compose_bak" "$LATEST_BACKUP_FILE" "$snap_file"
+
+    # 7. Update .env and compose if target image is different
+    if [ "$target_image" != "$cur_image" ]; then
+        info "Updating image reference in .env to ${target_image}..."
+        if grep -q '^EVOLUTION_IMAGE=' "${INSTALL_DIR}/.env"; then
+            sed -i.bak "s|^EVOLUTION_IMAGE=.*|EVOLUTION_IMAGE=${target_image}|" "${INSTALL_DIR}/.env"
+            rm -f "${INSTALL_DIR}/.env.bak"
+        else
+            printf 'EVOLUTION_IMAGE=%s\n' "$target_image" >> "${INSTALL_DIR}/.env"
+        fi
+    fi
+
+    # 8. Pull new image
+    print_section "Pulling Updated Images"
+    info "Pulling Docker image: ${target_image}..."
+    if [ "$TTY" = 1 ]; then
+        docker pull "$target_image" &
+        local pull_pid=$!
+        _spin "$pull_pid" "Pulling updated Evolution API image..."
+        if ! wait "$pull_pid"; then
+            err "Failed to pull Docker image: ${target_image}"
+            warn "Aborting update. Existing containers were not modified."
+            exit 1
+        fi
+    else
+        if ! docker pull "$target_image"; then
+            err "Failed to pull Docker image: ${target_image}"
+            warn "Aborting update. Existing containers were not modified."
+            exit 1
+        fi
+    fi
+    ok "Docker image ${target_image} downloaded successfully."
+
+    # 9. Apply updates with docker compose up -d
+    print_section "Recreating Evolution API Stack"
+    info "Applying container update with Docker Compose..."
+    if ! $COMPOSE_CMD up -d --remove-orphans; then
+        err "Docker Compose failed to apply the update."
+        warn "Safety rollback is available to restore the previous state."
+        if ask "Execute automatic ROLLBACK now?"; then
+            perform_rollback
+        fi
+        exit 1
+    fi
+    ok "Containers recreated and updated."
+
+    # 10. Health check verification
+    info "Waiting for Evolution API to become healthy..."
+    local attempts=0
+    local max_attempts=40
+    local healthy=0
+
+    while [ $attempts -lt $max_attempts ]; do
+        attempts=$(( attempts + 1 ))
+        if [ "$TTY" = 1 ]; then
+            printf '\r  \033[1;36m⠋\033[0m Verifying Evolution API health check (attempt %d/%d)...' "$attempts" "$max_attempts" > /dev/tty 2>/dev/null || true
+        fi
+
+        if curl -sf --max-time 3 "http://localhost:${cur_port}/" >/dev/null 2>&1; then
+            healthy=1
+            break
+        fi
+        sleep 3
+    done
+    [ "$TTY" = 1 ] && printf '\r\033[K' > /dev/tty 2>/dev/null || true
+
+    if [ "$healthy" -ne 1 ]; then
+        err "Evolution API health check failed after update!"
+        warn "The container may have crashed or failed database migrations."
+        printf '\n'
+        info "Recent container logs:"
+        $COMPOSE_CMD logs --tail=40 evolution-api 2>&1 || true
+        printf '\n'
+        warn "Safety rollback is available to restore your previous configuration and database."
+        if ask "Execute automatic ROLLBACK now?"; then
+            perform_rollback
+        fi
+        exit 1
+    fi
+
+    ok "Evolution API is responding with HTTP 200 OK on port ${cur_port}!"
+
+    # 11. Summary
+    print_section "Update Complete"
+    ok "Evolution API has been safely updated and verified!"
+    printf '\n'
+    printf '    %s %s -> %s\n' "Container Image:" "$cur_image" "${C_GREEN}${target_image}${C_RESET}"
+    printf '    %s %s\n'      "API URL        :" "${C_CYAN}${cur_url}${C_RESET}"
+    printf '    %s %s\n'      "Pre-Update Snap:" "${C_CYAN}${snap_file}${C_RESET}"
+    printf '    %s %s\n'      "Safety Backup  :" "${C_CYAN}${LATEST_BACKUP_FILE}${C_RESET}"
+    printf '    %s %s\n'      "Rollback File  :" "${C_CYAN}${LATEST_MANIFEST}${C_RESET}"
+    printf '    %s %s\n'      "Execution Log  :" "${LOG_FILE}"
+    printf '\n'
+    info "If any issues arise with this new version, you can roll back at any time with:"
+    printf '    %s\n' "${C_BOLD}sudo bash $0 --rollback${C_RESET}"
+    printf '\n'
+    log "Evolution API update completed. Maintainer: Inova e-Business"
+    printf '\n'
     exit 0
 }
 
@@ -1106,17 +1540,19 @@ main_install() {
     printf '    %s %s\n' "Persistence:" "Docker named volumes (evolution_instances, evolution_postgres_data)"
     printf '\n'
     printf '  %s\n' "${C_BOLD}Management Commands:${C_RESET}"
-    printf '    %s\n' "Check status:  $0 --status"
+    printf '    %s\n' "Check API Key: $0 --apiKey"
     printf '    %s\n' "View logs:     $0 --logs"
     printf '    %s\n' "Restart stack: $0 --restart"
     printf '    %s\n' "Stop stack:    $0 --stop"
     printf '    %s\n' "Start stack:   $0 --start"
     printf '    %s\n' "Create backup: $0 --backup"
+    printf '    %s\n' "Update stack:  $0 --update"
+    printf '    %s\n' "Rollback:      $0 --rollback"
     if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
         printf '    %s\n' "Systemd:       sudo systemctl status evolution-api"
     fi
     printf '\n'
-    log "Evolution API installer completed. Maintainer: Inova e-Business"
+    log "Evolution API service completed. Maintainer: Inova e-Business"
     printf '\n'
 }
 
@@ -1125,11 +1561,15 @@ main_install() {
 # -----------------------------------------------------------------------------
 case "$ACTION" in
     status)    action_status ;;
+    apikey)    action_apikey ;;
     start)     action_start ;;
     stop)      action_stop ;;
     restart)   action_restart ;;
     logs)      action_logs ;;
     backup)    action_backup ;;
+    update)    action_update ;;
+    rollback)  perform_rollback ;;
+    snapshot)  action_snapshot ;;
     uninstall) action_uninstall ;;
     check)     main_install ;;
     install)   main_install ;;

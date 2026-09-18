@@ -199,10 +199,11 @@ fetch_script_list() {
     fi
     json="$(cat "$tmpf")"; rm -f "$tmpf"
     if command -v jq >/dev/null 2>&1; then
-        echo "$json" | jq -r '.[].name' | grep '\.sh$' | grep -v "^${SELF}$"
+        echo "$json" | jq -r '.[].name' | grep -E '(\.sh$|^service-)' | grep -v "^${SELF}$"
     else
-        echo "$json" | grep -oE '"name": *"[^"]+\.sh"' \
+        echo "$json" | grep -oE '"name": *"[^"]+"' \
             | sed 's/.*"name": *"//; s/"$//' \
+            | grep -E '(\.sh$|^service-)' \
             | grep -v "^${SELF}$"
     fi
 }
