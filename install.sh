@@ -32,7 +32,7 @@
 #   inovatils list | update | remove ... # same commands as install.sh
 #
 # Bootstrap (download the manager itself):
-#   curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh -o install.sh
+#   curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh -o install.sh
 #   bash install.sh
 #
 # Notes:
@@ -49,7 +49,7 @@ set -uo pipefail
 
 VERSION="2.10"
 
-REPO="inovaebiz/devops-utilities"
+REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 API_URL="https://api.github.com/repos/${REPO}/contents"

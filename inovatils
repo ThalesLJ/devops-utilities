@@ -25,7 +25,7 @@
 #   inovatils --help           # show help
 #
 # Bootstrap (one-time install of the global command):
-#   curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh | sudo bash -s -- inovatils
+#   curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh | sudo bash -s -- inovatils
 #   # or, if you already have install.sh locally:
 #   sudo bash install.sh inovatils
 # ==============================================================================
@@ -34,7 +34,7 @@ set -uo pipefail
 
 VERSION="1.0"
 
-REPO="inovaebiz/devops-utilities"
+REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
 RAW_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
 STATE_DIR="${HOME}/.inova-devops"

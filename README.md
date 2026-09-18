@@ -18,13 +18,18 @@
 
 ## 📑 Sumário
 
-- [Sobre o projeto](#-sobre-o-projeto)
-- [Requisitos](#-requisitos)
-- [Instalação](#-instalação)
-- [Scripts disponíveis](#-scripts-disponíveis)
-- [Aviso legal](#-aviso-legal)
-- [Contribuindo](#-contribuindo)
-- [Licença](#-licença)
+- [📑 Sumário](#-sumário)
+- [💡 Sobre o projeto](#-sobre-o-projeto)
+- [🧰 Requisitos](#-requisitos)
+- [🚀 Instalação](#-instalação)
+  - [Comando global `inovatils`](#comando-global-inovatils)
+  - [Menu interativo (sem o comando global)](#menu-interativo-sem-o-comando-global)
+  - [Comandos do gerenciador](#comandos-do-gerenciador)
+  - [Instalação direta (sem menu)](#instalação-direta-sem-menu)
+- [📦 Scripts disponíveis](#-scripts-disponíveis)
+- [⚖️ Aviso legal](#️-aviso-legal)
+- [🤝 Contribuindo](#-contribuindo)
+- [📄 Licença](#-licença)
 
 ---
 
@@ -54,7 +59,7 @@ relação ao repositório. Depois da primeira instalação, use o comando global
 Instale o comando global (uma única vez):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh | sudo bash -s -- inovatils
+curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh | sudo bash -s -- inovatils
 ```
 ou, se você já baixou o install.sh:
 ```bash
@@ -80,7 +85,7 @@ inovatils --help
 Baixe o gerenciador e abra o menu:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh -o /tmp/install.sh
+curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh -o /tmp/install.sh
 sudo bash /tmp/install.sh
 ```
 
@@ -106,19 +111,19 @@ inovatils self-update                              # atualiza gerenciador + coma
 Para baixar e instalar um script em uma única linha:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh | sudo bash -s -- <script> [diretorio]
+curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh | sudo bash -s -- <script> [diretorio]
 ```
 
 Exemplo com o `docker-cleanup.sh` (instala em `/usr/local/sbin` com `chmod 750`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh | sudo bash -s -- docker-cleanup.sh
+curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh | sudo bash -s -- docker-cleanup.sh
 ```
 
 Ou instale em um diretório customizado:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh | sudo bash -s -- docker-cleanup.sh /opt/scripts
+curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh | sudo bash -s -- docker-cleanup.sh /opt/scripts
 ```
 
 > ℹ️ Os scripts são instalados em `/usr/local/sbin` (que exige privilégios de
@@ -126,17 +131,17 @@ curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/ins
 
 ## 📦 Scripts disponíveis
 
-| Script | Descrição | Plataformas | Instalação |
-| --- | --- | --- | --- |
-| [`docker-cleanup.sh`](./docker-cleanup.sh) | Limpeza automática de imagens, containers parados, redes não utilizadas e cache de build do Docker, preservando sempre os volumes. | Linux · macOS · Windows (Docker Desktop) | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- docker-cleanup.sh` |
-| [`sys-update-checker.sh`](./sys-update-checker.sh) | Analisa pacotes, kernel e serviços que precisam de atualização e aplica as atualizações de forma segura após aceite (modo interativo ou `--yes`). | Linux · macOS · Windows | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- sys-update-checker.sh` |
-| [`threat-scan.sh`](./threat-scan.sh) | Varredura somente-leitura que identifica indícios de vírus, worms, malwares, mineradores, backdoors e persistências suspeitas (processos, rede, agendamentos, usuários, arquivos, kernel). | Linux · macOS · Windows | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- threat-scan.sh` |
-| [`disk-health.sh`](./disk-health.sh) | Diagnóstico de disco, inodes e crescimento de logs; oferece limpezas seguras de journal, logs rotacionados e arquivos temporários antigos, reportando espaço reclamável do Docker. | Linux · macOS · Windows | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- disk-health.sh` |
-| [`opencode-installer.sh`](./opencode-installer.sh) | Baixa e instala o OpenCode (AI coding agent) pelo melhor método da plataforma (script oficial, Homebrew, npm, Chocolatey, Scoop, pacman). | Linux · macOS · Windows | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- opencode-installer.sh` |
-| [`installer-updater-docker.sh`](./installer-updater-docker.sh) | Instalação e atualização segura do Docker Engine e Compose V2 para a última versão estável, com pré-checagens, snapshot (.txt), backup e rollback automático/manual (`--rollback`) de versões e projetos. | Linux | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- installer-updater-docker.sh` |
-| [`evolution-api-installer.sh`](./evolution-api-installer.sh) | Instalação, configuração e gerenciamento da Evolution API v2 em Linux via Docker e Docker Compose, com persistência completa (PostgreSQL + Redis AOF + volumes), segurança e boas práticas de produção. | Linux | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- evolution-api-installer.sh` |
-| [`install.sh`](./install.sh) | Gerenciador/instalador: baixa, rastreia versões, atualiza e remove os scripts, com menu interativo e comandos de linha. | Linux · macOS · Windows | — |
-| [`inovatils`](./inovatils) | Comando global (wrapper) para o gerenciador — chamável de qualquer diretório (`inovatils list`, `inovatils update`, ...). | Linux · macOS · Windows | `curl -fsSL https://raw.githubusercontent.com/inovaebiz/devops-utilities/main/install.sh \| sudo bash -s -- inovatils` |
+| Script                                                         | Descrição                                                                                                                                                                                                 | Plataformas                              | Instalação                                                                                                                              |
+| -------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| [`docker-cleanup.sh`](./docker-cleanup.sh)                     | Limpeza automática de imagens, containers parados, redes não utilizadas e cache de build do Docker, preservando sempre os volumes.                                                                        | Linux · macOS · Windows (Docker Desktop) | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- docker-cleanup.sh`           |
+| [`sys-update-checker.sh`](./sys-update-checker.sh)             | Analisa pacotes, kernel e serviços que precisam de atualização e aplica as atualizações de forma segura após aceite (modo interativo ou `--yes`).                                                         | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- sys-update-checker.sh`       |
+| [`threat-scan.sh`](./threat-scan.sh)                           | Varredura somente-leitura que identifica indícios de vírus, worms, malwares, mineradores, backdoors e persistências suspeitas (processos, rede, agendamentos, usuários, arquivos, kernel).                | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- threat-scan.sh`              |
+| [`disk-health.sh`](./disk-health.sh)                           | Diagnóstico de disco, inodes e crescimento de logs; oferece limpezas seguras de journal, logs rotacionados e arquivos temporários antigos, reportando espaço reclamável do Docker.                        | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- disk-health.sh`              |
+| [`opencode-installer.sh`](./opencode-installer.sh)             | Baixa e instala o OpenCode (AI coding agent) pelo melhor método da plataforma (script oficial, Homebrew, npm, Chocolatey, Scoop, pacman).                                                                 | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- opencode-installer.sh`       |
+| [`installer-updater-docker.sh`](./installer-updater-docker.sh) | Instalação e atualização segura do Docker Engine e Compose V2 para a última versão estável, com pré-checagens, snapshot (.txt), backup e rollback automático/manual (`--rollback`) de versões e projetos. | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- installer-updater-docker.sh` |
+| [`evolution-api-installer.sh`](./evolution-api-installer.sh)   | Instalação, configuração e gerenciamento da Evolution API v2 em Linux via Docker e Docker Compose, com persistência completa (PostgreSQL + Redis AOF + volumes), segurança e boas práticas de produção.   | Linux                                    | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- evolution-api-installer.sh`  |
+| [`install.sh`](./install.sh)                                   | Gerenciador/instalador: baixa, rastreia versões, atualiza e remove os scripts, com menu interativo e comandos de linha.                                                                                   | Linux · macOS · Windows                  | —                                                                                                                                       |
+| [`inovatils`](./inovatils)                                     | Comando global (wrapper) para o gerenciador — chamável de qualquer diretório (`inovatils list`, `inovatils update`, ...).                                                                                 | Linux · macOS · Windows                  | `curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/install.sh \| sudo bash -s -- inovatils`                   |
 
 ## ⚖️ Aviso legal
 
