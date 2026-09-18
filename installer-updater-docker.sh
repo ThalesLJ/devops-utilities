@@ -1,0 +1,1154 @@
+#!/bin/bash
+
+# ==============================================================================
+# Docker Engine & Compose — Automated Installer & Safe Updater
+#
+# Maintainer: Inova e-Business
+# Version: 1.1
+#
+# Purpose:
+#   Install and safely update Docker Engine and Docker Compose V2 to the latest
+#   stable release on Linux with pre-flight safety checks, container state
+#   snapshots, configuration backups and automated/on-demand rollback.
+#
+# Supported platforms:
+#   - Linux   : Ubuntu, Debian, CentOS, RHEL, Rocky Linux, AlmaLinux, Fedora, Arch
+#
+# Safety & Rollback Features:
+#   - Full pre-flight verification before update (disk space, RAM, package locks).
+#   - Package manager lock and transaction integrity validation.
+#   - Network reachability test to official Docker repositories.
+#   - Impact analysis for running containers & Docker Compose projects.
+#   - Generates a comprehensive pre-update snapshot (.txt) documenting all
+#     running/stopped containers, images, volumes, networks, and disk usage.
+#   - Configuration backup (.tar.gz) of /etc/docker and daemon.json.
+#   - Machine-readable rollback manifest recording exact package versions,
+#     running container IDs and Compose project directories.
+#   - On-demand rollback (--rollback) to downgrade packages, restore configs,
+#     and bring previous containers and Compose stacks back online.
+#   - Automatic rollback prompt if daemon fails or packages break during update.
+#   - First-class Docker Compose V2 support (docker-compose-plugin).
+#
+# Behavior:
+#   - Without flags: checks status, runs pre-flight validation, creates snapshot,
+#     confirms with user, and installs/updates Docker to the latest version.
+#   - With -y / --yes: unattended install/update with safety checks, snapshots
+#     and automatic rollback if update fails.
+#   - With -c / --check-only: run all checks and report current vs latest version
+#     without making any modifications to the system.
+#   - With --rollback: restore Docker, Compose, and containers to the last saved state.
+#   - With --snapshot-only: only generate the pre-update state snapshot (.txt).
+#   - With --status: display current Docker & Compose versions, daemon state and workloads.
+#
+# ==============================================================================
+
+# Ensure execution under Bash (re-exec if invoked via /bin/sh, dash, ash, etc.)
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "ERROR: installer-updater-docker requires Bash. Please run: sudo bash $0" >&2
+        exit 1
+    fi
+fi
+
+set -uo pipefail
+
+VERSION="1.1"
+TAG="installer-updater-docker"
+
+# -----------------------------------------------------------------------------
+# Options & Defaults
+# -----------------------------------------------------------------------------
+ASSUME_YES=0
+CHECK_ONLY=0
+SNAPSHOT_ONLY=0
+ACTION="run"
+
+TTY=0
+[ -t 1 ] && TTY=1
+
+if [ "$TTY" = 1 ]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN=""
+    C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN=""
+fi
+
+SPIN_FRAMES=('|' '/' '-' '\\')
+if [[ "$(locale charmap 2>/dev/null)" == *"UTF"* ]]; then
+    SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+fi
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '  \033[1;34m[INFO]\033[0m %s\n' "$*"; }
+ok()   { printf '  \033[1;32m[OK]\033[0m   %s\n' "$*"; }
+warn() { printf '  \033[1;33m[WARN]\033[0m %s\n' "$*"; }
+err()  { printf '  \033[1;31m[ERR]\033[0m  %s\n' "$*"; }
+
+START_TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)"
+LOG_DIR="/var/log/inova-devops"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [ ! -w "$LOG_DIR" ]; then
+    LOG_DIR="${TMPDIR:-/tmp}/inova-devops"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="${LOG_DIR}/docker-installer-updater-${START_TS}.log"
+if touch "$LOG_FILE" 2>/dev/null; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+LATEST_MANIFEST="${LOG_DIR}/docker-rollback-manifest.env"
+
+_spin() {
+    local pid="$1" label="$2" i=0 n=${#SPIN_FRAMES[@]}
+    [ "$TTY" = 1 ] || return 0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  \033[1;36m%s\033[0m %s   ' "${SPIN_FRAMES[$i]}" "$label" > /dev/tty 2>/dev/null || true
+        i=$(( (i + 1) % n ))
+        sleep 0.08
+    done
+    printf '\r\033[K' > /dev/tty 2>/dev/null || true
+}
+
+run_spinner() {
+    local label="$1"; shift
+    local tmp rc
+    tmp="$(mktemp)" || return 1
+
+    if [ "$TTY" = 1 ]; then
+        "$@" >"$tmp" 2>&1 &
+        local pid=$!
+        _spin "$pid" "$label"
+        wait "$pid"
+        rc=$?
+    else
+        "$@" >"$tmp" 2>&1
+        rc=$?
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# -----------------------------------------------------------------------------
+# Lock Management
+# -----------------------------------------------------------------------------
+LOCK_DIR="${TMPDIR:-/tmp}/installer-updater-docker.lock"
+acquire_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        err "Another Docker installer/updater process is currently running."
+        exit 1
+    fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+# -----------------------------------------------------------------------------
+# Privilege and UI Helpers
+# -----------------------------------------------------------------------------
+run_elevated() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        if ! command -v sudo >/dev/null 2>&1; then
+            err "Root privileges are required and 'sudo' was not found."
+            return 1
+        fi
+        sudo "$@"
+    fi
+}
+
+ask() {
+    if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+    local answer
+    printf '  \033[1;36m[?]\033[0m %s [y/N] ' "$1" > /dev/tty
+    if [ -r /dev/tty ]; then
+        read -r answer < /dev/tty
+    else
+        read -r answer
+    fi
+    case "$answer" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+print_banner() {
+    printf '\n'
+    printf '  %s\n' '============================================================'
+    printf '  %s\n' '  DOCKER ENGINE & COMPOSE — INSTALLER & SAFE UPDATER'
+    printf '  %s\n' '  Maintainer: Inova e-Business'
+    printf '  %s\n' "  Version: $VERSION"
+    printf '  %s\n' '============================================================'
+    printf '\n'
+}
+
+print_section() {
+    local HR="------------------------------------------------------------"
+    printf '\n  %s\n' "$HR"
+    printf '  %s\n' "  $1"
+    printf '  %s\n' "$HR"
+    printf '\n'
+}
+
+# -----------------------------------------------------------------------------
+# Usage
+# -----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Options:
+  -y, --yes               Install or update without asking for confirmation.
+  -c, --check-only        Run all pre-flight checks and report versions without changes.
+      --rollback          Roll back to the previous Docker & Compose version and restore state.
+      --snapshot-only     Only generate the pre-update runtime state snapshot (.txt).
+      --status            Show current Docker installation status, compose stacks and workload.
+  -h, --help              Show this help message.
+
+Examples:
+  $0                      Interactive check, snapshot, and install/update
+  $0 -y                   Automated unattended install/update with safety snapshots
+  $0 -c                   Check compatibility, locks, and versions only
+  $0 --rollback           Restore previous Docker version, configuration and containers
+  $0 --snapshot-only      Generate a complete diagnostic snapshot of Docker resources
+  $0 --status             Check Docker daemon, compose version and running projects
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes)           ASSUME_YES=1; shift ;;
+        -c|--check-only)    CHECK_ONLY=1; ACTION="check"; shift ;;
+        --rollback)         ACTION="rollback"; shift ;;
+        --snapshot-only)    SNAPSHOT_ONLY=1; ACTION="snapshot"; shift ;;
+        --status)           ACTION="status"; shift ;;
+        -h|--help)          usage; exit 0 ;;
+        *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+# Platform & Environment Detection
+# -----------------------------------------------------------------------------
+OS_TYPE="$(uname -s 2>/dev/null || echo unknown)"
+ARCH="$(uname -m 2>/dev/null || echo unknown)"
+DISTRO_ID="unknown"
+DISTRO_VERSION="unknown"
+DISTRO_CODENAME="unknown"
+PKG_MGR="unknown"
+
+detect_environment() {
+    if [ "$OS_TYPE" != "Linux" ]; then
+        err "This script is designed specifically for Linux environments (found: $OS_TYPE)."
+        return 1
+    fi
+
+    if [ -f /etc/os-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        DISTRO_ID="${ID:-unknown}"
+        DISTRO_VERSION="${VERSION_ID:-unknown}"
+        DISTRO_CODENAME="${VERSION_CODENAME:-${UBUNTU_CODENAME:-unknown}}"
+    elif [ -f /etc/redhat-release ]; then
+        DISTRO_ID="rhel"
+    elif [ -f /etc/debian_version ]; then
+        DISTRO_ID="debian"
+    fi
+
+    case "$DISTRO_ID" in
+        ubuntu|debian|raspbian|pop|linuxmint|kali)
+            PKG_MGR="apt"
+            ;;
+        centos|rhel|rocky|almalinux|fedora|ol)
+            if command -v dnf >/dev/null 2>&1; then
+                PKG_MGR="dnf"
+            else
+                PKG_MGR="yum"
+            fi
+            ;;
+        arch|manjaro)
+            PKG_MGR="pacman"
+            ;;
+        opensuse*|sles)
+            PKG_MGR="zypper"
+            ;;
+        *)
+            PKG_MGR="unknown"
+            ;;
+    esac
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Version Helpers
+# -----------------------------------------------------------------------------
+get_installed_docker_version() {
+    if command -v docker >/dev/null 2>&1; then
+        docker --version 2>/dev/null | sed -E 's/Docker version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/' || echo "installed"
+    else
+        echo "none"
+    fi
+}
+
+get_installed_compose_version() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        docker compose version 2>/dev/null | head -n1 || echo "installed"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        docker-compose --version 2>/dev/null | head -n1 || echo "installed"
+    else
+        echo "none"
+    fi
+}
+
+get_pkg_version() {
+    local pkg="$1"
+    case "$PKG_MGR" in
+        apt)
+            dpkg -s "$pkg" 2>/dev/null | awk '/^Version:/ {print $2}' || true
+            ;;
+        dnf|yum)
+            rpm -q --qf '%{VERSION}-%{RELEASE}' "$pkg" 2>/dev/null || true
+            ;;
+        pacman)
+            pacman -Q "$pkg" 2>/dev/null | awk '{print $2}' || true
+            ;;
+    esac
+}
+
+# -----------------------------------------------------------------------------
+# Safety Pre-flight Checks
+# -----------------------------------------------------------------------------
+run_preflight_checks() {
+    print_section "Safety Pre-flight Checks"
+    local check_failed=0
+
+    # 1. Architecture check
+    case "$ARCH" in
+        x86_64|amd64|aarch64|arm64|armv7l)
+            ok "CPU Architecture: $ARCH (supported)"
+            ;;
+        *)
+            warn "CPU Architecture: $ARCH (official Docker CE support may be experimental)"
+            ;;
+    esac
+
+    # 2. Linux Distro check
+    if [ "$PKG_MGR" = "unknown" ]; then
+        err "Unsupported distribution ($DISTRO_ID). Supported: Debian, Ubuntu, CentOS, RHEL, Rocky, AlmaLinux, Fedora, Arch."
+        check_failed=1
+    else
+        ok "Distribution: $DISTRO_ID $DISTRO_VERSION (package manager: $PKG_MGR)"
+    fi
+
+    # 3. WSL Detection check
+    if uname -r | grep -qi "microsoft"; then
+        info "Running inside Windows Subsystem for Linux (WSL2)."
+    fi
+
+    # 4. Disk space verification
+    local docker_data_dir="/var/lib/docker"
+    local check_path="/"
+    if [ -d "$docker_data_dir" ]; then
+        check_path="$docker_data_dir"
+    fi
+    local free_mb
+    free_mb="$(df -m "$check_path" 2>/dev/null | tail -1 | awk '{print $4}' || echo 0)"
+    if [ "$free_mb" -lt 2000 ]; then
+        err "Insufficient disk space on $check_path: only ${free_mb}MB available. Minimum required: 2000MB."
+        check_failed=1
+    else
+        ok "Disk space: ${free_mb}MB available on $check_path"
+    fi
+
+    # 5. System RAM check
+    local mem_total_kb mem_total_mb
+    mem_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    mem_total_mb=$(( mem_total_kb / 1024 ))
+    if [ "$mem_total_mb" -lt 512 ] && [ "$mem_total_mb" -gt 0 ]; then
+        warn "Low system RAM (${mem_total_mb}MB). Daemon restart may be slow."
+    else
+        ok "System RAM: ${mem_total_mb}MB"
+    fi
+
+    # 6. Package manager locks and integrity check
+    info "Verifying package manager state..."
+    if [ "$PKG_MGR" = "apt" ]; then
+        local lock_found=0
+        for lfile in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock; do
+            if [ -e "$lfile" ] && fuser "$lfile" >/dev/null 2>&1; then
+                lock_found=1
+                err "Package manager is currently locked by another process ($lfile)."
+                check_failed=1
+                break
+            fi
+        done
+        if [ "$lock_found" -eq 0 ]; then
+            ok "Package manager is unlocked."
+        fi
+
+        # Check for broken dpkg configurations
+        if command -v dpkg >/dev/null 2>&1; then
+            if dpkg --audit 2>/dev/null | grep -q '[a-zA-Z]'; then
+                err "There are incomplete or broken package installations detected (dpkg --audit)."
+                info "Run 'sudo dpkg --configure -a' to fix broken packages before updating Docker."
+                check_failed=1
+            fi
+        fi
+    elif [ "$PKG_MGR" = "dnf" ] || [ "$PKG_MGR" = "yum" ]; then
+        if [ -f /var/run/yum.pid ] && fuser /var/run/yum.pid >/dev/null 2>&1; then
+            err "YUM/DNF is currently locked by another process."
+            check_failed=1
+        else
+            ok "Package manager is unlocked."
+        fi
+    fi
+
+    # 7. Network and Docker repository connectivity check
+    info "Testing network connectivity to download.docker.com..."
+    local net_ok=0
+    if curl -sI --max-time 5 https://download.docker.com >/dev/null 2>&1; then
+        net_ok=1
+    elif curl -sI --max-time 5 https://get.docker.com >/dev/null 2>&1; then
+        net_ok=1
+    fi
+
+    if [ "$net_ok" -eq 1 ]; then
+        ok "Docker official download repositories are reachable."
+    else
+        err "Cannot reach https://download.docker.com. Check internet connection, DNS or firewall."
+        check_failed=1
+    fi
+
+    # 8. Check running containers, compose projects and live-restore
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        local running_cnt
+        running_cnt="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+        info "Running Docker containers detected: $running_cnt"
+
+        # Check Compose projects
+        if docker compose version >/dev/null 2>&1; then
+            local compose_cnt
+            compose_cnt="$(docker compose ls -q 2>/dev/null | wc -l | tr -d ' ')"
+            info "Active Docker Compose projects detected: $compose_cnt"
+        fi
+
+        if [ "$running_cnt" -gt 0 ]; then
+            local live_restore=0
+            if [ -f /etc/docker/daemon.json ] && grep -qi '"live-restore"[[:space:]]*:[[:space:]]*true' /etc/docker/daemon.json 2>/dev/null; then
+                live_restore=1
+                ok "Docker 'live-restore' is enabled (containers will continue running during daemon reload)."
+            else
+                warn "Docker 'live-restore' is NOT enabled in /etc/docker/daemon.json."
+                warn "Updating Docker daemon may cause a brief restart or pause in the $running_cnt running container(s)."
+            fi
+        fi
+    fi
+
+    if [ "$check_failed" -ne 0 ]; then
+        err "Safety pre-flight checks detected issues. Aborting to protect system integrity."
+        return 1
+    fi
+
+    ok "All safety pre-flight checks passed successfully."
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Pre-Update State Snapshot (.txt), Backup (.tar.gz) & Rollback Manifest
+# -----------------------------------------------------------------------------
+generate_pre_update_snapshot() {
+    print_section "Pre-Update State Snapshot & Rollback Manifest"
+
+    local snap_file="${LOG_DIR}/docker-pre-update-${START_TS}.txt"
+    local backup_file="${LOG_DIR}/docker-config-backup-${START_TS}.tar.gz"
+    local manifest_file="${LOG_DIR}/docker-rollback-manifest-${START_TS}.env"
+
+    info "Generating comprehensive snapshot of Docker runtime state..."
+
+    # Extract exact package versions
+    local prev_docker_ce prev_docker_cli prev_containerd prev_compose prev_buildx
+    prev_docker_ce="$(get_pkg_version "docker-ce")"
+    prev_docker_cli="$(get_pkg_version "docker-ce-cli")"
+    prev_containerd="$(get_pkg_version "containerd.io")"
+    prev_compose="$(get_pkg_version "docker-compose-plugin")"
+    prev_buildx="$(get_pkg_version "docker-buildx-plugin")"
+
+    # Inventory running container IDs
+    local running_containers=""
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        running_containers="$(docker ps -q 2>/dev/null | tr '\n' ' ')"
+    fi
+
+    # Inventory active Docker Compose project directories
+    local compose_workdirs=""
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        # Method 1: Container labels
+        local from_labels
+        from_labels="$(docker ps --filter "label=com.docker.compose.project.working_dir" --format '{{.Label "com.docker.compose.project.working_dir"}}' 2>/dev/null | sort -u | tr '\n' ':')"
+        compose_workdirs="${from_labels}"
+
+        # Method 2: docker compose ls
+        if docker compose version >/dev/null 2>&1; then
+            local from_ls
+            from_ls="$(docker compose ls --format '{{.ConfigFiles}}' 2>/dev/null | while IFS= read -r f; do [ -n "$f" ] && dirname "$f"; done | sort -u | tr '\n' ':')"
+            compose_workdirs="${compose_workdirs}${from_ls}"
+        fi
+    fi
+
+    # 1. Write the .txt Human-Readable Diagnostic Snapshot
+    {
+        printf '%s\n' '==============================================================================='
+        printf '%s\n' 'DOCKER PRE-UPDATE STATE SNAPSHOT'
+        printf 'Generated by: Inova DevOps Utilities (installer-updater-docker.sh)\n'
+        printf 'Timestamp   : %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf 'Hostname    : %s\n' "$(hostname 2>/dev/null || uname -n)"
+        printf 'Kernel      : %s\n' "$(uname -a)"
+        printf 'Linux Distro: %s %s (%s)\n' "$DISTRO_ID" "$DISTRO_VERSION" "$DISTRO_CODENAME"
+        printf '%s\n\n' '==============================================================================='
+
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '1. CURRENT VERSIONS BEFORE UPDATE'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        if command -v docker >/dev/null 2>&1; then
+            docker --version 2>&1 || true
+            printf '\nDetailed Docker Version:\n'
+            docker version 2>&1 || true
+        else
+            printf 'Docker is not installed.\n'
+        fi
+        printf '\nInstalled Package Versions:\n'
+        printf '  docker-ce            : %s\n' "${prev_docker_ce:-not installed}"
+        printf '  docker-ce-cli        : %s\n' "${prev_docker_cli:-not installed}"
+        printf '  containerd.io        : %s\n' "${prev_containerd:-not installed}"
+        printf '  docker-compose-plugin: %s\n' "${prev_compose:-not installed}"
+        printf '  docker-buildx-plugin : %s\n' "${prev_buildx:-not installed}"
+
+        printf '\nContainerd Version:\n'
+        containerd --version 2>&1 || echo "containerd not found on PATH"
+        printf '\nRunc Version:\n'
+        runc --version 2>&1 || echo "runc not found on PATH"
+        printf '\nDocker Compose Version:\n'
+        if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+            docker compose version 2>&1 || true
+        elif command -v docker-compose >/dev/null 2>&1; then
+            docker-compose --version 2>&1 || true
+        else
+            printf 'docker compose is not installed.\n'
+        fi
+
+        if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '2. ACTIVE DOCKER COMPOSE PROJECTS (docker compose ls)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            if docker compose version >/dev/null 2>&1; then
+                docker compose ls -a 2>&1 || true
+            else
+                printf 'Docker compose not installed.\n'
+            fi
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '3. DOCKER DAEMON SYSTEM INFORMATION (docker info)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker info 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '4. CURRENTLY RUNNING CONTAINERS (docker ps)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker ps --no-trunc 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '5. ALL CONTAINERS (RUNNING & STOPPED)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker ps -a --no-trunc 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '6. CONTAINER STATS SNAPSHOT'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker stats --no-stream --no-trunc 2>&1 || echo "Could not query docker stats."
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '7. DOCKER IMAGES (docker images)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker images --no-trunc --digests 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '8. DOCKER VOLUMES (docker volume ls)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker volume ls 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '9. DOCKER NETWORKS (docker network ls)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker network ls --no-trunc 2>&1 || true
+
+            printf '\n%s\n' '-------------------------------------------------------------------------------'
+            printf '%s\n' '10. DOCKER DISK USAGE (docker system df -v)'
+            printf '%s\n' '-------------------------------------------------------------------------------'
+            docker system df -v 2>&1 || true
+        else
+            printf '\nDocker daemon is not running or not yet installed.\n'
+        fi
+
+        printf '\n%s\n' '-------------------------------------------------------------------------------'
+        printf '%s\n' '11. DOCKER CONFIGURATION FILES'
+        printf '%s\n' '-------------------------------------------------------------------------------'
+        if [ -f /etc/docker/daemon.json ]; then
+            printf 'File: /etc/docker/daemon.json:\n'
+            cat /etc/docker/daemon.json 2>&1 || true
+        else
+            printf '/etc/docker/daemon.json does not exist.\n'
+        fi
+        if [ -d /etc/systemd/system/docker.service.d ]; then
+            printf '\nDrop-in dir: /etc/systemd/system/docker.service.d:\n'
+            ls -la /etc/systemd/system/docker.service.d/ 2>&1 || true
+        fi
+    } > "$snap_file"
+
+    chmod 640 "$snap_file" 2>/dev/null || true
+    ok "Pre-update state snapshot generated:"
+    printf '    %s\n' "${C_CYAN}${snap_file}${C_RESET}"
+
+    # 2. Backup /etc/docker configuration files
+    if [ -d /etc/docker ]; then
+        info "Creating backup archive of /etc/docker..."
+        tar -czf "$backup_file" -C /etc docker 2>/dev/null || true
+        if [ -f "$backup_file" ]; then
+            chmod 600 "$backup_file" 2>/dev/null || true
+            ok "Configuration backup archive created:"
+            printf '    %s\n' "${C_CYAN}${backup_file}${C_RESET}"
+        fi
+    fi
+
+    # 3. Write Machine-Readable Rollback Manifest
+    cat <<EOF > "$manifest_file"
+# Docker Rollback Manifest
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+PKG_MGR="${PKG_MGR}"
+PREV_DOCKER_CE="${prev_docker_ce:-}"
+PREV_DOCKER_CLI="${prev_docker_cli:-}"
+PREV_CONTAINERD="${prev_containerd:-}"
+PREV_COMPOSE="${prev_compose:-}"
+PREV_BUILDX="${prev_buildx:-}"
+SNAPSHOT_FILE="${snap_file}"
+BACKUP_CONFIG_TAR="${backup_file}"
+RUNNING_CONTAINERS="${running_containers}"
+COMPOSE_WORKDIRS="${compose_workdirs}"
+EOF
+
+    chmod 600 "$manifest_file" 2>/dev/null || true
+    cp "$manifest_file" "$LATEST_MANIFEST" 2>/dev/null || true
+    ok "Rollback manifest saved for automatic/manual recovery."
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Installation & Safe Update Operations
+# -----------------------------------------------------------------------------
+setup_official_repository() {
+    info "Configuring official Docker repository for $DISTRO_ID..."
+
+    case "$PKG_MGR" in
+        apt)
+            run_elevated apt-get update -qq
+            run_elevated apt-get install -y -qq ca-certificates curl gnupg
+            run_elevated install -m 0755 -d /etc/apt/keyrings
+            if ! curl -fsSL "https://download.docker.com/linux/${DISTRO_ID}/gpg" -o /tmp/docker.gpg 2>/dev/null; then
+                # Fallback to debian key if derivative
+                curl -fsSL "https://download.docker.com/linux/debian/gpg" -o /tmp/docker.gpg
+            fi
+            run_elevated gpg --dearmor --yes -o /etc/apt/keyrings/docker.gpg /tmp/docker.gpg 2>/dev/null || true
+            run_elevated chmod a+r /etc/apt/keyrings/docker.gpg
+            rm -f /tmp/docker.gpg
+
+            local distro_for_repo="$DISTRO_ID"
+            case "$DISTRO_ID" in
+                pop|linuxmint|kali) distro_for_repo="ubuntu" ;;
+                raspbian)           distro_for_repo="debian" ;;
+            esac
+
+            local repo_codename="$DISTRO_CODENAME"
+            if [ -z "$repo_codename" ] || [ "$repo_codename" = "unknown" ]; then
+                repo_codename="$(. /etc/os-release 2>/dev/null && echo "${UBUNTU_CODENAME:-${VERSION_CODENAME:-jammy}}")"
+            fi
+
+            local arch_tag
+            case "$ARCH" in
+                x86_64|amd64)   arch_tag="amd64" ;;
+                aarch64|arm64)  arch_tag="arm64" ;;
+                armv7l)         arch_tag="armhf" ;;
+                *)              arch_tag="amd64" ;;
+            esac
+
+            echo "deb [arch=${arch_tag} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${distro_for_repo} ${repo_codename} stable" \
+                | run_elevated tee /etc/apt/sources.list.d/docker.list > /dev/null
+            run_elevated apt-get update -qq
+            ;;
+
+        dnf|yum)
+            run_elevated "$PKG_MGR" install -y -q yum-utils
+            local repo_url="https://download.docker.com/linux/centos/docker-ce.repo"
+            if [ "$DISTRO_ID" = "fedora" ]; then
+                repo_url="https://download.docker.com/linux/fedora/docker-ce.repo"
+            elif [ "$DISTRO_ID" = "rhel" ]; then
+                repo_url="https://download.docker.com/linux/rhel/docker-ce.repo"
+            fi
+            run_elevated yum-config-manager --add-repo "$repo_url" 2>/dev/null || true
+            ;;
+
+        pacman)
+            # Arch Linux includes official docker packages in extra repos
+            run_elevated pacman -Sy --noconfirm
+            ;;
+    esac
+    return 0
+}
+
+perform_install_or_update() {
+    local is_update=0
+    if command -v docker >/dev/null 2>&1; then
+        is_update=1
+    fi
+
+    if [ "$is_update" -eq 1 ]; then
+        print_section "Updating Docker Engine & Compose to Latest Stable"
+        info "Current version: $(get_installed_docker_version)"
+    else
+        print_section "Installing Docker Engine & Compose"
+    fi
+
+    setup_official_repository
+
+    info "Installing / updating Docker CE and Compose V2 packages..."
+    local pkgs_to_install=()
+    local rc=0
+
+    case "$PKG_MGR" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            pkgs_to_install=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+            if [ "$is_update" -eq 1 ]; then
+                run_spinner "Updating Docker packages via apt..." \
+                    run_elevated apt-get install -y --only-upgrade "${pkgs_to_install[@]}" || \
+                    run_elevated apt-get install -y "${pkgs_to_install[@]}"
+                rc=$?
+            else
+                run_spinner "Installing Docker packages via apt..." \
+                    run_elevated apt-get install -y "${pkgs_to_install[@]}"
+                rc=$?
+            fi
+            ;;
+
+        dnf|yum)
+            pkgs_to_install=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+            run_spinner "Installing/updating Docker packages via $PKG_MGR..." \
+                run_elevated "$PKG_MGR" install -y "${pkgs_to_install[@]}"
+            rc=$?
+            ;;
+
+        pacman)
+            run_spinner "Installing/updating Docker packages via pacman..." \
+                run_elevated pacman -S --noconfirm --needed docker docker-compose
+            rc=$?
+            ;;
+    esac
+
+    if [ $rc -ne 0 ]; then
+        err "Package manager update failed with exit code $rc."
+        return $rc
+    fi
+
+    # Ensure systemd services are enabled and started
+    if command -v systemctl >/dev/null 2>&1; then
+        info "Reloading systemd daemon..."
+        run_elevated systemctl daemon-reload 2>/dev/null || true
+        info "Enabling and starting docker.service..."
+        run_elevated systemctl enable --now docker 2>/dev/null || true
+        run_elevated systemctl restart docker 2>/dev/null || true
+    elif command -v service >/dev/null 2>&1; then
+        run_elevated service docker restart 2>/dev/null || run_elevated service docker start 2>/dev/null || true
+    fi
+
+    # Add sudo user to docker group if present
+    if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+        run_elevated usermod -aG docker "$SUDO_USER" 2>/dev/null || true
+        info "Added user '$SUDO_USER' to group 'docker'."
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Workload Recovery & Verification
+# -----------------------------------------------------------------------------
+restore_workloads() {
+    local running_cids="$1"
+    local compose_dirs="$2"
+
+    if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+        warn "Docker daemon is not available; cannot restore workloads."
+        return 1
+    fi
+
+    # 1. Restore Docker Compose projects
+    if [ -n "$compose_dirs" ]; then
+        IFS=':' read -r -a pdirs <<< "$compose_dirs"
+        for pdir in "${pdirs[@]}"; do
+            [ -n "$pdir" ] || continue
+            if [ -d "$pdir" ] && { [ -f "${pdir}/docker-compose.yml" ] || [ -f "${pdir}/docker-compose.yaml" ] || [ -f "${pdir}/compose.yaml" ]; }; then
+                info "Re-starting Docker Compose project in ${C_CYAN}${pdir}${C_RESET}..."
+                (cd "$pdir" && docker compose up -d --remove-orphans 2>/dev/null) || true
+            fi
+        done
+    fi
+
+    # 2. Restore individual running containers
+    if [ -n "$running_cids" ]; then
+        for cid in $running_cids; do
+            [ -n "$cid" ] || continue
+            if ! docker ps -q --no-trunc | grep -q "^${cid}"; then
+                info "Starting container $cid..."
+                docker start "$cid" 2>/dev/null || true
+            fi
+        done
+    fi
+
+    return 0
+}
+
+verify_post_update() {
+    print_section "Post-Update Verification"
+
+    if ! command -v docker >/dev/null 2>&1; then
+        err "Docker binary was not found after installation/update."
+        return 1
+    fi
+
+    local new_ver
+    new_ver="$(get_installed_docker_version)"
+    local new_compose
+    new_compose="$(get_installed_compose_version)"
+
+    ok "Docker Engine version: $new_ver"
+    ok "Docker Compose version: $new_compose"
+
+    # Test daemon connectivity
+    info "Validating Docker daemon socket..."
+    local attempts=0
+    local max_attempts=15
+    local daemon_ready=0
+    while [ $attempts -lt $max_attempts ]; do
+        attempts=$(( attempts + 1 ))
+        if docker info >/dev/null 2>&1; then
+            daemon_ready=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$daemon_ready" -eq 1 ]; then
+        ok "Docker daemon is active and responding."
+    else
+        err "Docker daemon is not responding. Check logs with 'journalctl -u docker'."
+        return 1
+    fi
+
+    # Check and restore workloads if any stopped during daemon restart
+    if [ -f "$LATEST_MANIFEST" ]; then
+        # shellcheck disable=SC1090
+        . "$LATEST_MANIFEST"
+        if [ -n "${RUNNING_CONTAINERS:-}" ] || [ -n "${COMPOSE_WORKDIRS:-}" ]; then
+            info "Verifying pre-existing workloads..."
+            restore_workloads "${RUNNING_CONTAINERS:-}" "${COMPOSE_WORKDIRS:-}"
+        fi
+    fi
+
+    local active_now
+    active_now="$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+    ok "Containers currently running: $active_now"
+
+    if docker compose version >/dev/null 2>&1; then
+        local active_compose
+        active_compose="$(docker compose ls -q 2>/dev/null | wc -l | tr -d ' ')"
+        ok "Active Docker Compose projects: $active_compose"
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Rollback Implementation
+# -----------------------------------------------------------------------------
+perform_rollback() {
+    print_banner
+    print_section "Docker & Compose Rollback"
+
+    local manifest=""
+    if [ -f "$LATEST_MANIFEST" ]; then
+        manifest="$LATEST_MANIFEST"
+    else
+        # Find latest manifest in LOG_DIR
+        manifest="$(ls -t "${LOG_DIR}"/docker-rollback-manifest-*.env 2>/dev/null | head -n1 || true)"
+    fi
+
+    if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+        err "No rollback manifest found in $LOG_DIR."
+        err "A rollback is only possible after at least one update has generated a manifest."
+        exit 1
+    fi
+
+    info "Loading rollback manifest: ${C_CYAN}${manifest}${C_RESET}"
+    # shellcheck disable=SC1090
+    . "$manifest"
+
+    if [ -z "${PREV_DOCKER_CE:-}" ] && [ -z "${PREV_COMPOSE:-}" ]; then
+        err "Manifest does not contain valid previous version information."
+        exit 1
+    fi
+
+    printf '\n'
+    info "Rollback Targets:"
+    printf '    %s %s\n' "Docker CE    :" "${PREV_DOCKER_CE:-none}"
+    printf '    %s %s\n' "Docker CLI   :" "${PREV_DOCKER_CLI:-none}"
+    printf '    %s %s\n' "Containerd   :" "${PREV_CONTAINERD:-none}"
+    printf '    %s %s\n' "Compose V2   :" "${PREV_COMPOSE:-none}"
+    printf '    %s %s\n' "Config Backup:" "${BACKUP_CONFIG_TAR:-none}"
+    printf '\n'
+
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        if ! ask "Are you sure you want to ROLL BACK Docker and restore all previous projects/containers?"; then
+            warn "Rollback cancelled by user."
+            exit 0
+        fi
+    fi
+
+    info "Initiating package downgrade..."
+    case "${PKG_MGR:-apt}" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            local dg_args=()
+            [ -n "${PREV_DOCKER_CE:-}" ]    && dg_args+=("docker-ce=${PREV_DOCKER_CE}")
+            [ -n "${PREV_DOCKER_CLI:-}" ]   && dg_args+=("docker-ce-cli=${PREV_DOCKER_CLI}")
+            [ -n "${PREV_CONTAINERD:-}" ]   && dg_args+=("containerd.io=${PREV_CONTAINERD}")
+            [ -n "${PREV_COMPOSE:-}" ]      && dg_args+=("docker-compose-plugin=${PREV_COMPOSE}")
+            [ -n "${PREV_BUILDX:-}" ]       && dg_args+=("docker-buildx-plugin=${PREV_BUILDX}")
+
+            run_spinner "Downgrading Docker & Compose packages..." \
+                run_elevated apt-get install -y --allow-downgrades "${dg_args[@]}"
+            ;;
+
+        dnf|yum)
+            local dg_args=()
+            [ -n "${PREV_DOCKER_CE:-}" ]    && dg_args+=("docker-ce-${PREV_DOCKER_CE}")
+            [ -n "${PREV_DOCKER_CLI:-}" ]   && dg_args+=("docker-ce-cli-${PREV_DOCKER_CLI}")
+            [ -n "${PREV_CONTAINERD:-}" ]   && dg_args+=("containerd.io-${PREV_CONTAINERD}")
+            [ -n "${PREV_COMPOSE:-}" ]      && dg_args+=("docker-compose-plugin-${PREV_COMPOSE}")
+
+            run_spinner "Downgrading Docker & Compose packages via $PKG_MGR..." \
+                run_elevated "$PKG_MGR" downgrade -y "${dg_args[@]}"
+            ;;
+
+        pacman)
+            warn "Automatic package downgrade on Arch requires packages in pacman cache."
+            ;;
+    esac
+
+    # Restore /etc/docker configuration
+    if [ -n "${BACKUP_CONFIG_TAR:-}" ] && [ -f "$BACKUP_CONFIG_TAR" ]; then
+        info "Restoring /etc/docker from backup archive..."
+        run_elevated tar -xzf "$BACKUP_CONFIG_TAR" -C /etc 2>/dev/null || true
+        ok "Configuration restored."
+    fi
+
+    # Restart Docker service
+    info "Restarting Docker service..."
+    if command -v systemctl >/dev/null 2>&1; then
+        run_elevated systemctl daemon-reload 2>/dev/null || true
+        run_elevated systemctl restart docker 2>/dev/null || true
+    elif command -v service >/dev/null 2>&1; then
+        run_elevated service docker restart 2>/dev/null || true
+    fi
+
+    # Wait for daemon
+    local daemon_ready=0
+    for _ in $(seq 1 15); do
+        if docker info >/dev/null 2>&1; then
+            daemon_ready=1
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$daemon_ready" -eq 1 ]; then
+        ok "Docker daemon is active and responding."
+    else
+        err "Docker daemon did not start after rollback. Inspect 'journalctl -u docker'."
+        exit 1
+    fi
+
+    # Restore all running containers and Compose stacks
+    info "Restoring all projects, volumes and containers to their pre-update state..."
+    restore_workloads "${RUNNING_CONTAINERS:-}" "${COMPOSE_WORKDIRS:-}"
+
+    print_section "Rollback Summary"
+    ok "Rollback completed successfully!"
+    printf '\n'
+    printf '    %s %s\n' "Restored Docker Engine :" "${C_GREEN}$(get_installed_docker_version)${C_RESET}"
+    printf '    %s %s\n' "Restored Docker Compose:" "${C_GREEN}$(get_installed_compose_version)${C_RESET}"
+    printf '    %s %s\n' "Running Containers     :" "$(docker ps -q 2>/dev/null | wc -l | tr -d ' ')"
+    if docker compose version >/dev/null 2>&1; then
+        printf '    %s %s\n' "Active Compose Projects:" "$(docker compose ls -q 2>/dev/null | wc -l | tr -d ' ')"
+    fi
+    printf '\n'
+    log "Docker rollback completed. Maintainer: Inova e-Business"
+    printf '\n'
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Action Handlers
+# -----------------------------------------------------------------------------
+action_status() {
+    print_banner
+    print_section "Docker & Compose Status"
+
+    detect_environment || true
+
+    local cur_docker
+    cur_docker="$(get_installed_docker_version)"
+    local cur_compose
+    cur_compose="$(get_installed_compose_version)"
+
+    info "Platform      : $DISTRO_ID $DISTRO_VERSION ($ARCH)"
+    info "Docker Engine : $cur_docker"
+    info "Docker Compose: $cur_compose"
+
+    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+        ok "Daemon Status : Active and responding"
+        printf '\n'
+        info "Docker System Storage:"
+        docker system df 2>&1
+
+        if docker compose version >/dev/null 2>&1; then
+            printf '\n'
+            info "Active Docker Compose Projects:"
+            docker compose ls 2>&1
+        fi
+
+        printf '\n'
+        info "Running Containers:"
+        docker ps 2>&1
+    else
+        warn "Docker daemon is not running or not installed."
+    fi
+    exit 0
+}
+
+action_snapshot() {
+    print_banner
+    detect_environment || exit 1
+    generate_pre_update_snapshot
+    exit 0
+}
+
+action_main() {
+    acquire_lock
+    print_banner
+
+    detect_environment || exit 1
+
+    local cur_docker
+    cur_docker="$(get_installed_docker_version)"
+    local cur_compose
+    cur_compose="$(get_installed_compose_version)"
+
+    info "Current Docker Engine : ${C_BOLD}${cur_docker}${C_RESET}"
+    info "Current Docker Compose: ${C_BOLD}${cur_compose}${C_RESET}"
+
+    # Run safety checks
+    run_preflight_checks || exit 1
+
+    # Check only mode
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        printf '\n'
+        ok "Check-only mode completed. System is fully compatible and ready for Docker install/update."
+        info "Run without -c to proceed: sudo bash $0"
+        exit 0
+    fi
+
+    # Confirm action with user
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        printf '\n'
+        if [ "$cur_docker" = "none" ]; then
+            if ! ask "Install Docker Engine and Docker Compose V2 to the latest stable version?"; then
+                warn "Installation cancelled by user."
+                exit 0
+            fi
+        else
+            if ! ask "Proceed with safe update of Docker Engine to the latest stable release?"; then
+                warn "Update cancelled by user."
+                exit 0
+            fi
+        fi
+    fi
+
+    # Generate snapshot and backup before any update
+    generate_pre_update_snapshot
+
+    # Perform install / update
+    if ! perform_install_or_update; then
+        err "Docker update process encountered errors."
+        if [ "$cur_docker" != "none" ]; then
+            warn "Safety rollback is available to restore your previous Docker version and running projects."
+            if ask "Execute automatic ROLLBACK now?"; then
+                perform_rollback
+            fi
+        fi
+        exit 1
+    fi
+
+    # Verify results
+    if ! verify_post_update; then
+        err "Post-update health check failed."
+        if [ "$cur_docker" != "none" ]; then
+            warn "Safety rollback is available to restore your previous Docker version and running projects."
+            if ask "Execute automatic ROLLBACK now?"; then
+                perform_rollback
+            fi
+        fi
+        exit 1
+    fi
+
+    print_section "Summary"
+    ok "Docker Engine & Compose process completed successfully!"
+    printf '\n'
+    printf '    %s %s -> %s\n' "Docker Engine :" "$cur_docker" "${C_GREEN}$(get_installed_docker_version)${C_RESET}"
+    printf '    %s %s\n'      "Docker Compose:" "${C_GREEN}$(get_installed_compose_version)${C_RESET}"
+    printf '    %s %s\n'      "State Snapshot:" "${C_CYAN}${LOG_DIR}/docker-pre-update-${START_TS}.txt${C_RESET}"
+    printf '    %s %s\n'      "Rollback File :" "${C_CYAN}${LATEST_MANIFEST}${C_RESET}"
+    printf '    %s %s\n'      "Execution Log :" "${LOG_FILE}"
+    printf '\n'
+    info "If any unexpected issue arises, you can roll back at any time with:"
+    printf '    %s\n' "${C_BOLD}sudo bash $0 --rollback${C_RESET}"
+    printf '\n'
+    log "Docker installer/updater completed. Maintainer: Inova e-Business"
+    printf '\n'
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch
+# -----------------------------------------------------------------------------
+case "$ACTION" in
+    status)   action_status ;;
+    snapshot) action_snapshot ;;
+    rollback) perform_rollback ;;
+    check)    action_main ;;
+    run)      action_main ;;
+    *)        err "Unknown action: $ACTION"; usage; exit 1 ;;
+esac

@@ -1,0 +1,1137 @@
+#!/bin/bash
+
+# ==============================================================================
+# Evolution API Installer & Lifecycle Manager
+#
+# Maintainer: Inova e-Business
+# Version: 1.0
+#
+# Purpose:
+#   Install, configure, run and manage Evolution API on Linux using Docker and
+#   Docker Compose with persistence, security hardening and production best
+#   practices.
+#
+# Supported platforms:
+#   - Linux   : Ubuntu, Debian, CentOS, RHEL, Rocky Linux, AlmaLinux, Fedora, Arch
+#
+# Behavior:
+#   - Without flags: interactive wizard asking for configuration, checking
+#     pre-requisites, installing Docker (if missing), configuring .env and
+#     docker-compose.yml, and starting Evolution API with health verification.
+#   - With -y / --yes: unattended install using defaults and secure credentials.
+#   - With -c / --check-only: only check pre-requisites and report status.
+#   - With --status / --start / --stop / --restart / --logs / --backup / --uninstall:
+#     lifecycle management operations for the Evolution API stack.
+#
+# Docker & Persistence Features:
+#   - Automated Docker Engine and Compose V2 installation if missing.
+#   - Dedicated PostgreSQL 15 and Redis 7 services with healthchecks.
+#   - Persistent Docker volumes for database, Redis AOF, and WhatsApp instances.
+#   - Hardened isolated internal Docker network (DB & Redis not exposed to host).
+#   - Docker log rotation (max-size 20m, max-file 3) to prevent disk exhaustion.
+#   - Automatic container restart policy (unless-stopped) + systemd unit.
+#   - Strict file permissions (chmod 600 for .env, chmod 750 for project dir).
+#   - Cryptographically secure credential generation (API key, DB & Redis passwords).
+#
+# ==============================================================================
+
+# Ensure execution under Bash (re-exec if invoked via /bin/sh, dash, ash, etc.)
+if [ -z "${BASH_VERSION:-}" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        echo "ERROR: Evolution API installer requires Bash. Please install bash and run: sudo bash $0" >&2
+        exit 1
+    fi
+fi
+
+set -uo pipefail
+
+VERSION="1.0"
+TAG="evolution-api-installer"
+
+# -----------------------------------------------------------------------------
+# Default Configuration
+# -----------------------------------------------------------------------------
+ASSUME_YES=0
+CHECK_ONLY=0
+ACTION="install"
+
+DEFAULT_INSTALL_DIR="/opt/evolution-api"
+INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+DEFAULT_PORT=8080
+EVOLUTION_PORT="$DEFAULT_PORT"
+SERVER_URL=""
+AUTHENTICATION_API_KEY=""
+
+DEFAULT_IMAGE="evoapicloud/evolution-api:latest"
+EVOLUTION_IMAGE="$DEFAULT_IMAGE"
+
+POSTGRES_VERSION="15-alpine"
+POSTGRES_DB="evolution"
+POSTGRES_USER="evolution"
+POSTGRES_PASSWORD=""
+
+REDIS_VERSION="7-alpine"
+REDIS_PASSWORD=""
+
+INSTALL_SYSTEMD=1
+
+# -----------------------------------------------------------------------------
+# Styling, Colors & Logging
+# -----------------------------------------------------------------------------
+log()  { printf '%s\n' "$*"; }
+info() { printf '  \033[1;34m[INFO]\033[0m %s\n' "$*"; }
+ok()   { printf '  \033[1;32m[OK]\033[0m   %s\n' "$*"; }
+warn() { printf '  \033[1;33m[WARN]\033[0m %s\n' "$*"; }
+err()  { printf '  \033[1;31m[ERR]\033[0m  %s\n' "$*"; }
+
+TTY=0
+[ -t 1 ] && TTY=1
+
+if [ "$TTY" = 1 ]; then
+    C_RESET=$'\033[0m'
+    C_BOLD=$'\033[1m'
+    C_DIM=$'\033[2m'
+    C_RED=$'\033[31m'
+    C_GREEN=$'\033[32m'
+    C_YELLOW=$'\033[33m'
+    C_BLUE=$'\033[34m'
+    C_MAGENTA=$'\033[35m'
+    C_CYAN=$'\033[36m'
+else
+    C_RESET="" C_BOLD="" C_DIM="" C_RED="" C_GREEN=""
+    C_YELLOW="" C_BLUE="" C_MAGENTA="" C_CYAN=""
+fi
+
+SPIN_FRAMES=('|' '/' '-' '\\')
+if [[ "$(locale charmap 2>/dev/null)" == *"UTF"* ]]; then
+    SPIN_FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+fi
+
+START_TS="$(date +%Y%m%d-%H%M%S 2>/dev/null || echo unknown)"
+LOG_DIR="/var/log/inova-devops"
+if ! mkdir -p "$LOG_DIR" 2>/dev/null || [ ! -w "$LOG_DIR" ]; then
+    LOG_DIR="${TMPDIR:-/tmp}/inova-devops"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
+fi
+LOG_FILE="${LOG_DIR}/evolution-api-install-${START_TS}.log"
+if touch "$LOG_FILE" 2>/dev/null; then
+    exec > >(tee -a "$LOG_FILE") 2>&1
+fi
+
+_spin() {
+    local pid="$1" label="$2" i=0 n=${#SPIN_FRAMES[@]}
+    [ "$TTY" = 1 ] || return 0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r  \033[1;36m%s\033[0m %s   ' "${SPIN_FRAMES[$i]}" "$label" > /dev/tty 2>/dev/null || true
+        i=$(( (i + 1) % n ))
+        sleep 0.08
+    done
+    printf '\r\033[K' > /dev/tty 2>/dev/null || true
+}
+
+run_spinner() {
+    local label="$1"; shift
+    local tmp rc
+    tmp="$(mktemp)" || return 1
+
+    if [ "$TTY" = 1 ]; then
+        "$@" >"$tmp" 2>&1 &
+        local pid=$!
+        _spin "$pid" "$label"
+        wait "$pid"
+        rc=$?
+    else
+        "$@" >"$tmp" 2>&1
+        rc=$?
+    fi
+
+    cat "$tmp"
+    rm -f "$tmp"
+    return "$rc"
+}
+
+# -----------------------------------------------------------------------------
+# Lock Management (portable mkdir-based lock)
+# -----------------------------------------------------------------------------
+LOCK_DIR="${TMPDIR:-/tmp}/evolution-api-installer.lock"
+acquire_lock() {
+    if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+        err "Another Evolution API installer process is currently running."
+        exit 1
+    fi
+    trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+}
+
+# -----------------------------------------------------------------------------
+# Helper Functions
+# -----------------------------------------------------------------------------
+run_elevated() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        if ! command -v sudo >/dev/null 2>&1; then
+            err "Command requires root privileges and 'sudo' is not installed."
+            return 1
+        fi
+        sudo "$@"
+    fi
+}
+
+ask() {
+    if [ "$ASSUME_YES" -eq 1 ]; then return 0; fi
+    local answer
+    printf '  \033[1;36m[?]\033[0m %s [y/N] ' "$1" > /dev/tty
+    if [ -r /dev/tty ]; then
+        read -r answer < /dev/tty
+    else
+        read -r answer
+    fi
+    case "$answer" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+}
+
+prompt_value() {
+    local prompt="$1" default="$2" var_name="$3"
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        eval "$var_name=\"$default\""
+        return 0
+    fi
+    local answer
+    printf '  \033[1;36m[?]\033[0m %s [%s]: ' "$prompt" "$default" > /dev/tty
+    if [ -r /dev/tty ]; then
+        read -r answer < /dev/tty
+    else
+        read -r answer
+    fi
+    if [ -z "$answer" ]; then
+        eval "$var_name=\"$default\""
+    else
+        eval "$var_name=\"$answer\""
+    fi
+}
+
+generate_secret() {
+    local length="${1:-32}"
+    if command -v openssl >/dev/null 2>&1; then
+        openssl rand -hex "$(( length / 2 ))" 2>/dev/null
+    elif [ -r /dev/urandom ]; then
+        tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c "$length" || true
+    else
+        echo "$(date +%s%N 2>/dev/null)${RANDOM}${RANDOM}" | md5sum | head -c "$length"
+    fi
+}
+
+detect_server_url() {
+    local port="${1:-8080}"
+    local ip=""
+    # 1. Try public IP lookup
+    ip="$(curl -fsSL --max-time 2 https://api.ipify.org 2>/dev/null || curl -fsSL --max-time 2 https://ifconfig.me 2>/dev/null || true)"
+    # 2. Try primary host interface IP
+    if [ -z "$ip" ]; then
+        ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    # 3. Fallback to localhost
+    if [ -z "$ip" ]; then
+        ip="localhost"
+    fi
+    echo "http://${ip}:${port}"
+}
+
+print_banner() {
+    printf '\n'
+    printf '  %s\n' '============================================================'
+    printf '  %s\n' '  EVOLUTION API — INSTALLER & LIFECYCLE MANAGER'
+    printf '  %s\n' '  Maintainer: Inova e-Business'
+    printf '  %s\n' "  Version: $VERSION"
+    printf '  %s\n' '============================================================'
+    printf '\n'
+}
+
+print_section() {
+    local HR="------------------------------------------------------------"
+    printf '\n  %s\n' "$HR"
+    printf '  %s\n' "  $1"
+    printf '  %s\n' "$HR"
+    printf '\n'
+}
+
+# -----------------------------------------------------------------------------
+# Usage / Help
+# -----------------------------------------------------------------------------
+usage() {
+    cat <<EOF
+Usage: $0 [OPTIONS]
+
+Installation Options:
+  -y, --yes               Install using defaults and generated secure keys without prompts.
+  -c, --check-only        Run system pre-flight checks only (no changes).
+      --dir PATH          Installation directory (default: /opt/evolution-api).
+      --port PORT         HTTP port to bind (default: 8080).
+      --api-key KEY       Custom global API key (auto-generated 64-char key if unset).
+      --server-url URL    External or public server URL (auto-detected if unset).
+      --image IMAGE       Evolution API Docker image (default: evoapicloud/evolution-api:latest).
+      --no-systemd        Do not install systemd service unit.
+
+Management Actions:
+      --status            Check status and health of the Evolution API stack.
+      --start             Start the Evolution API stack.
+      --stop              Stop the Evolution API stack (preserves volumes).
+      --restart           Restart all Evolution API containers.
+      --logs              View live logs from all containers.
+      --backup            Create an archive backup of config, database and instances.
+      --uninstall         Safely remove the containers and systemd service.
+
+General Options:
+  -h, --help              Show this help message.
+
+Examples:
+  $0                      Interactive installation wizard
+  $0 -y                   Unattended automatic installation with secure defaults
+  $0 -c                   Check prerequisites without modifying the system
+  $0 --status             Check status of running Evolution API stack
+  $0 --logs               Stream logs from Evolution API containers
+  $0 --backup             Backup database and WhatsApp instances
+EOF
+}
+
+# -----------------------------------------------------------------------------
+# CLI Argument Parsing
+# -----------------------------------------------------------------------------
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -y|--yes)               ASSUME_YES=1; shift ;;
+        -c|--check-only)        CHECK_ONLY=1; ACTION="check"; shift ;;
+        --dir)                  INSTALL_DIR="$2"; shift 2 ;;
+        --dir=*)                INSTALL_DIR="${1#*=}"; shift ;;
+        --port)                 EVOLUTION_PORT="$2"; shift 2 ;;
+        --port=*)               EVOLUTION_PORT="${1#*=}"; shift ;;
+        --api-key)              AUTHENTICATION_API_KEY="$2"; shift 2 ;;
+        --api-key=*)            AUTHENTICATION_API_KEY="${1#*=}"; shift ;;
+        --server-url)           SERVER_URL="$2"; shift 2 ;;
+        --server-url=*)         SERVER_URL="${1#*=}"; shift ;;
+        --image)                EVOLUTION_IMAGE="$2"; shift 2 ;;
+        --image=*)              EVOLUTION_IMAGE="${1#*=}"; shift ;;
+        --no-systemd)           INSTALL_SYSTEMD=0; shift ;;
+        --status)               ACTION="status"; shift ;;
+        --start)                ACTION="start"; shift ;;
+        --stop)                 ACTION="stop"; shift ;;
+        --restart)              ACTION="restart"; shift ;;
+        --logs)                 ACTION="logs"; shift ;;
+        --backup)               ACTION="backup"; shift ;;
+        --uninstall)            ACTION="uninstall"; shift ;;
+        -h|--help)              usage; exit 0 ;;
+        *) err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+done
+
+# -----------------------------------------------------------------------------
+# Platform & Requirement Verification
+# -----------------------------------------------------------------------------
+check_platform() {
+    local os_type
+    os_type="$(uname -s 2>/dev/null || echo unknown)"
+    if [ "$os_type" != "Linux" ]; then
+        err "Evolution API requires a native Linux environment (detected: $os_type)."
+        err "macOS and Windows hosts are not supported by this installer."
+        return 1
+    fi
+
+    local arch
+    arch="$(uname -m 2>/dev/null || echo unknown)"
+    case "$arch" in
+        x86_64|amd64|aarch64|arm64)
+            ok "Linux architecture compatible: $arch"
+            ;;
+        *)
+            warn "Architecture $arch may have limited Evolution API Docker image support."
+            ;;
+    esac
+    return 0
+}
+
+check_system_resources() {
+    # Check RAM
+    local mem_total_kb mem_total_mb
+    mem_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    mem_total_mb=$(( mem_total_kb / 1024 ))
+    if [ "$mem_total_mb" -gt 0 ]; then
+        if [ "$mem_total_mb" -lt 1500 ]; then
+            warn "Available RAM is ${mem_total_mb}MB. At least 2048MB is recommended for Evolution API + PostgreSQL + Redis."
+        else
+            ok "System RAM: ${mem_total_mb}MB"
+        fi
+    fi
+
+    # Check Disk space
+    local target_check="${INSTALL_DIR}"
+    [ -d "$target_check" ] || target_check="$(dirname "$target_check" 2>/dev/null || echo /)"
+    local free_disk_mb
+    free_disk_mb="$(df -m "$target_check" 2>/dev/null | tail -1 | awk '{print $4}' || echo 0)"
+    if [ "$free_disk_mb" -gt 0 ]; then
+        if [ "$free_disk_mb" -lt 3000 ]; then
+            warn "Free disk space on $target_check is ${free_disk_mb}MB. At least 5000MB is recommended."
+        else
+            ok "Available disk space: ${free_disk_mb}MB on $target_check"
+        fi
+    fi
+}
+
+check_port_available() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        if ss -tuln 2>/dev/null | grep -qE "[: ]${port}[[:space:]]"; then
+            return 1
+        fi
+    elif command -v netstat >/dev/null 2>&1; then
+        if netstat -tuln 2>/dev/null | grep -qE "[: ]${port}[[:space:]]"; then
+            return 1
+        fi
+    elif command -v lsof >/dev/null 2>&1; then
+        if lsof -i :"$port" >/dev/null 2>&1; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Docker & Docker Compose Management
+# -----------------------------------------------------------------------------
+DOCKER_BIN=""
+COMPOSE_CMD=""
+
+detect_docker() {
+    if command -v docker >/dev/null 2>&1; then
+        DOCKER_BIN="$(command -v docker)"
+        return 0
+    fi
+    return 1
+}
+
+detect_compose() {
+    if command -v docker >/dev/null 2>&1 && docker compose version >/dev/null 2>&1; then
+        COMPOSE_CMD="docker compose"
+        return 0
+    elif command -v docker-compose >/dev/null 2>&1; then
+        COMPOSE_CMD="docker-compose"
+        return 0
+    fi
+    return 1
+}
+
+ensure_docker_environment() {
+    print_section "Docker Environment Check"
+
+    if detect_docker; then
+        local docker_ver
+        docker_ver="$("$DOCKER_BIN" --version 2>/dev/null || echo unknown)"
+        ok "Docker is installed: $docker_ver"
+    else
+        err "Docker Engine is not installed on this system."
+        info "Evolution API requires Docker Engine to run in persistent production mode."
+        info "Please install Docker first using the dedicated utility:"
+        printf '    %s\n' "sudo bash ./installer-updater-docker.sh"
+        info "Or via inovatils: inovatils installer-updater-docker.sh"
+        return 1
+    fi
+
+    # Check if Docker daemon is running
+    if ! docker info >/dev/null 2>&1; then
+        info "Starting Docker daemon service..."
+        run_elevated systemctl start docker 2>/dev/null || run_elevated service docker start 2>/dev/null || true
+        sleep 2
+        if ! docker info >/dev/null 2>&1; then
+            err "Docker daemon is not running or current user lacks permissions."
+            err "Try running with sudo or ensure the docker service is active."
+            return 1
+        fi
+    fi
+    ok "Docker daemon is active and responding."
+
+    if detect_compose; then
+        local compose_ver
+        compose_ver="$($COMPOSE_CMD version 2>/dev/null || echo unknown)"
+        ok "Docker Compose is available: $compose_ver ($COMPOSE_CMD)"
+    else
+        err "Docker Compose V2 plugin was not found."
+        info "Please install or update Docker Compose using:"
+        printf '    %s\n' "sudo bash ./installer-updater-docker.sh"
+        return 1
+    fi
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Configuration Generation (.env and docker-compose.yml)
+# -----------------------------------------------------------------------------
+generate_configuration_files() {
+    print_section "Generating Configuration"
+
+    info "Creating target directory: $INSTALL_DIR"
+    run_elevated mkdir -p "$INSTALL_DIR"
+    run_elevated chmod 750 "$INSTALL_DIR"
+
+    # Set appropriate ownership if invoked with sudo
+    if [ -n "${SUDO_USER:-}" ]; then
+        run_elevated chown -R "${SUDO_USER}:${SUDO_USER}" "$INSTALL_DIR" 2>/dev/null || true
+    fi
+
+    # Passwords and keys
+    [ -z "$AUTHENTICATION_API_KEY" ] && AUTHENTICATION_API_KEY="$(generate_secret 64)"
+    [ -z "$POSTGRES_PASSWORD" ] && POSTGRES_PASSWORD="$(generate_secret 32)"
+    [ -z "$REDIS_PASSWORD" ] && REDIS_PASSWORD="$(generate_secret 32)"
+    [ -z "$SERVER_URL" ] && SERVER_URL="$(detect_server_url "$EVOLUTION_PORT")"
+
+    local env_file="${INSTALL_DIR}/.env"
+    local compose_file="${INSTALL_DIR}/docker-compose.yml"
+
+    # Check if .env already exists to preserve existing credentials
+    if [ -f "$env_file" ]; then
+        warn "Existing .env found at $env_file. Backing up to ${env_file}.bak"
+        cp "$env_file" "${env_file}.bak"
+    fi
+
+    info "Writing environment file (.env)..."
+    cat <<EOF > "$env_file"
+# ==============================================================================
+# Evolution API v2 Configuration
+# Generated by Inova DevOps Utilities (evolution-api-installer.sh)
+# Created: $(date '+%Y-%m-%d %H:%M:%S')
+# ==============================================================================
+
+# Server Settings
+SERVER_TYPE=http
+SERVER_PORT=${EVOLUTION_PORT}
+SERVER_URL=${SERVER_URL}
+
+# Authentication
+AUTHENTICATION_API_KEY=${AUTHENTICATION_API_KEY}
+AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+
+# Database Settings (PostgreSQL)
+DATABASE_ENABLED=true
+DATABASE_PROVIDER=postgresql
+DATABASE_CONNECTION_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+DATABASE_CONNECTION_CLIENT_NAME=evolution_api
+
+# Persistence & Data Storage
+DATABASE_SAVE_DATA_INSTANCE=true
+DATABASE_SAVE_DATA_NEW_MESSAGE=true
+DATABASE_SAVE_MESSAGE_UPDATE=true
+DATABASE_SAVE_DATA_CONTACTS=true
+DATABASE_SAVE_DATA_CHATS=true
+DATABASE_SAVE_DATA_LABELS=true
+DATABASE_SAVE_DATA_HISTORIC=true
+
+# Cache Settings (Redis)
+CACHE_REDIS_ENABLED=true
+CACHE_REDIS_URI=redis://:${REDIS_PASSWORD}@redis:6379/1
+CACHE_REDIS_PREFIX_KEY=evolution
+CACHE_REDIS_SAVE_INSTANCES=true
+CACHE_LOCAL_ENABLED=false
+
+# WhatsApp Baileys Client Settings
+DEL_INSTANCE=false
+CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API
+CONFIG_SESSION_PHONE_NAME=Chrome
+
+# Logging Settings
+LOG_LEVEL=ERROR,WARN,INFO
+LOG_COLOR=true
+LOG_BAILEYS=error
+
+# Internal Container Credentials
+POSTGRES_USER=${POSTGRES_USER}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+POSTGRES_DB=${POSTGRES_DB}
+REDIS_PASSWORD=${REDIS_PASSWORD}
+EVOLUTION_IMAGE=${EVOLUTION_IMAGE}
+EVOLUTION_PORT=${EVOLUTION_PORT}
+EOF
+
+    # Security best practice: lock down .env permissions
+    chmod 600 "$env_file"
+    ok "Wrote environment file with restricted permissions (chmod 600)."
+
+    info "Writing docker-compose.yml..."
+    cat <<'EOF' > "$compose_file"
+version: '3.8'
+
+services:
+  evolution-api:
+    image: ${EVOLUTION_IMAGE:-evoapicloud/evolution-api:latest}
+    container_name: evolution_api
+    restart: unless-stopped
+    ports:
+      - "${EVOLUTION_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      - SERVER_URL=${SERVER_URL}
+      - AUTHENTICATION_API_KEY=${AUTHENTICATION_API_KEY}
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      - DATABASE_CONNECTION_CLIENT_NAME=evolution_api
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://:${REDIS_PASSWORD}@redis:6379/1
+      - CACHE_REDIS_PREFIX_KEY=evolution
+      - CACHE_REDIS_SAVE_INSTANCES=true
+      - CACHE_LOCAL_ENABLED=false
+      - DATABASE_SAVE_DATA_INSTANCE=true
+      - DATABASE_SAVE_DATA_NEW_MESSAGE=true
+      - DATABASE_SAVE_MESSAGE_UPDATE=true
+      - DATABASE_SAVE_DATA_CONTACTS=true
+      - DATABASE_SAVE_DATA_CHATS=true
+      - DATABASE_SAVE_DATA_LABELS=true
+      - DATABASE_SAVE_DATA_HISTORIC=true
+      - DEL_INSTANCE=false
+      - CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API
+      - CONFIG_SESSION_PHONE_NAME=Chrome
+      - LOG_LEVEL=ERROR,WARN,INFO
+      - LOG_COLOR=true
+      - LOG_BAILEYS=error
+    volumes:
+      - evolution_instances:/evolution/instances
+      - evolution_store:/evolution/store
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - evolution-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: evolution_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - evolution-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: evolution_redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    volumes:
+      - redis_data:/data
+    networks:
+      - evolution-net
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping 2>/dev/null | grep -q PONG || redis-cli ping 2>/dev/null | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  evolution_instances:
+    name: evolution_instances
+  evolution_store:
+    name: evolution_store
+  postgres_data:
+    name: evolution_postgres_data
+  redis_data:
+    name: evolution_redis_data
+
+networks:
+  evolution-net:
+    name: evolution-net
+    driver: bridge
+EOF
+
+    chmod 644 "$compose_file"
+    ok "Wrote docker-compose.yml with production healthchecks and log rotation."
+}
+
+# -----------------------------------------------------------------------------
+# Systemd Service Unit
+# -----------------------------------------------------------------------------
+setup_systemd_service() {
+    if [ "$INSTALL_SYSTEMD" -ne 1 ] || ! command -v systemctl >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local unit_file="/etc/systemd/system/evolution-api.service"
+    info "Configuring systemd service unit ($unit_file)..."
+
+    local compose_exec
+    if [ "$COMPOSE_CMD" = "docker compose" ]; then
+        compose_exec="$(command -v docker) compose"
+    else
+        compose_exec="$(command -v docker-compose)"
+    fi
+
+    local tmp_unit
+    tmp_unit="$(mktemp)"
+    cat <<EOF > "$tmp_unit"
+[Unit]
+Description=Evolution API Service (Docker Compose)
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=${compose_exec} up -d --remove-orphans
+ExecStop=${compose_exec} down
+ExecReload=${compose_exec} restart
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    run_elevated cp "$tmp_unit" "$unit_file"
+    run_elevated chmod 644 "$unit_file"
+    rm -f "$tmp_unit"
+
+    run_elevated systemctl daemon-reload 2>/dev/null || true
+    run_elevated systemctl enable evolution-api.service 2>/dev/null || true
+    ok "Systemd service 'evolution-api.service' created and enabled on boot."
+}
+
+# -----------------------------------------------------------------------------
+# Deployment & Health Check
+# -----------------------------------------------------------------------------
+deploy_stack() {
+    print_section "Deploying Evolution API Containers"
+
+    info "Working directory: $INSTALL_DIR"
+    cd "$INSTALL_DIR" || { err "Failed to access $INSTALL_DIR"; return 1; }
+
+    info "Pulling container images..."
+    if [ "$TTY" = 1 ]; then
+        $COMPOSE_CMD pull &
+        local pull_pid=$!
+        _spin "$pull_pid" "Pulling Docker images (Evolution API, Postgres, Redis)..."
+        wait "$pull_pid" || { err "Failed to pull Docker images."; return 1; }
+    else
+        $COMPOSE_CMD pull || { err "Failed to pull Docker images."; return 1; }
+    fi
+    ok "All images downloaded successfully."
+
+    info "Starting containers in detached mode..."
+    if ! $COMPOSE_CMD up -d --remove-orphans; then
+        err "Failed to start Docker Compose stack."
+        return 1
+    fi
+    ok "Containers created and started."
+
+    # Wait for containers and verify health
+    info "Waiting for services to become healthy..."
+    local attempts=0
+    local max_attempts=40
+    local healthy=0
+
+    while [ $attempts -lt $max_attempts ]; do
+        attempts=$(( attempts + 1 ))
+        if [ "$TTY" = 1 ]; then
+            printf '\r  \033[1;36m⠋\033[0m Waiting for Evolution API to initialize (attempt %d/%d)...' "$attempts" "$max_attempts" > /dev/tty 2>/dev/null || true
+        fi
+
+        # Check API HTTP response
+        if curl -sf --max-time 2 "http://localhost:${EVOLUTION_PORT}/" >/dev/null 2>&1; then
+            healthy=1
+            break
+        fi
+        sleep 3
+    done
+    [ "$TTY" = 1 ] && printf '\r\033[K' > /dev/tty 2>/dev/null || true
+
+    if [ "$healthy" -eq 1 ]; then
+        ok "Evolution API is active and responding on port ${EVOLUTION_PORT}!"
+    else
+        warn "Evolution API did not respond within expected time."
+        warn "Containers may still be starting or initializing database migrations."
+        info "You can monitor the startup logs with: $0 --logs"
+    fi
+
+    return 0
+}
+
+# -----------------------------------------------------------------------------
+# Lifecycle Management Actions
+# -----------------------------------------------------------------------------
+action_status() {
+    print_banner
+    print_section "Evolution API Status"
+
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+
+    cd "$INSTALL_DIR" || exit 1
+    info "Installation directory: $INSTALL_DIR"
+
+    if [ -f "${INSTALL_DIR}/.env" ]; then
+        local configured_port
+        configured_port="$(grep -E '^SERVER_PORT=' "${INSTALL_DIR}/.env" | cut -d'=' -f2 | tr -d ' ' || echo "$DEFAULT_PORT")"
+        local configured_url
+        configured_url="$(grep -E '^SERVER_URL=' "${INSTALL_DIR}/.env" | cut -d'=' -f2 | tr -d ' ' || echo "unknown")"
+        info "Configured URL:  $configured_url"
+        info "Configured Port: $configured_port"
+    fi
+
+    printf '\n'
+    info "Running containers:"
+    $COMPOSE_CMD ps
+
+    printf '\n'
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q "evolution-api.service"; then
+        local sys_status
+        sys_status="$(systemctl is-active evolution-api.service 2>/dev/null || echo inactive)"
+        info "Systemd service (evolution-api.service): $sys_status"
+    fi
+
+    printf '\n'
+    info "Testing API endpoint (http://localhost:${EVOLUTION_PORT:-8080}/)..."
+    local http_code
+    http_code="$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 "http://localhost:${EVOLUTION_PORT:-8080}/" 2>/dev/null || echo "000")"
+    if [ "$http_code" = "200" ]; then
+        ok "Evolution API HTTP status: 200 OK"
+    else
+        warn "Evolution API HTTP response: $http_code (may be initializing or stopped)"
+    fi
+    exit 0
+}
+
+action_start() {
+    print_banner
+    info "Starting Evolution API stack at $INSTALL_DIR..."
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+    $COMPOSE_CMD up -d
+    ok "Evolution API stack started."
+    exit 0
+}
+
+action_stop() {
+    print_banner
+    info "Stopping Evolution API stack at $INSTALL_DIR..."
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+    $COMPOSE_CMD down
+    ok "Evolution API stack stopped. Data volumes preserved."
+    exit 0
+}
+
+action_restart() {
+    print_banner
+    info "Restarting Evolution API stack at $INSTALL_DIR..."
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+    $COMPOSE_CMD restart
+    ok "Evolution API stack restarted."
+    exit 0
+}
+
+action_logs() {
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+    info "Streaming Evolution API logs (press Ctrl+C to exit)..."
+    exec $COMPOSE_CMD logs -f --tail=100
+}
+
+action_backup() {
+    print_banner
+    print_section "Evolution API Backup"
+
+    if [ ! -d "$INSTALL_DIR" ] || [ ! -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        err "No Evolution API installation found at $INSTALL_DIR."
+        exit 1
+    fi
+    detect_compose || { err "Docker Compose is required."; exit 1; }
+    cd "$INSTALL_DIR" || exit 1
+
+    local backup_dir="${INSTALL_DIR}/backups"
+    mkdir -p "$backup_dir"
+
+    local b_ts
+    b_ts="$(date +%Y%m%d-%H%M%S)"
+    local b_file="${backup_dir}/evolution-api-backup-${b_ts}.tar.gz"
+    local db_dump="${backup_dir}/evolution-db-${b_ts}.sql"
+
+    # Extract database credentials from .env
+    local db_user db_name db_pass
+    db_user="$(grep -E '^POSTGRES_USER=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+    db_name="$(grep -E '^POSTGRES_DB=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "evolution")"
+    db_pass="$(grep -E '^POSTGRES_PASSWORD=' "${INSTALL_DIR}/.env" | cut -d'=' -f2- | tr -d ' ' || echo "")"
+
+    info "Exporting PostgreSQL database..."
+    if docker ps --format '{{.Names}}' | grep -q "^evolution_postgres$"; then
+        if docker exec -e PGPASSWORD="$db_pass" evolution_postgres pg_dump -U "$db_user" "$db_name" > "$db_dump" 2>/dev/null; then
+            ok "Database dumped to $db_dump"
+        else
+            warn "Failed to execute pg_dump inside evolution_postgres container."
+            rm -f "$db_dump"
+        fi
+    else
+        warn "evolution_postgres container is not running; skipping database dump."
+    fi
+
+    # Backup instances volume using a temporary alpine container
+    local instances_tar="${backup_dir}/instances-${b_ts}.tar.gz"
+    info "Archiving WhatsApp instances volume..."
+    if docker volume inspect evolution_instances >/dev/null 2>&1; then
+        docker run --rm \
+            -v evolution_instances:/instances:ro \
+            -v "$backup_dir":/backup \
+            alpine tar -czf "/backup/instances-${b_ts}.tar.gz" -C /instances . 2>/dev/null || true
+        [ -f "$instances_tar" ] && ok "Instances archived to $instances_tar"
+    fi
+
+    info "Creating compressed final archive ($b_file)..."
+    tar -czf "$b_file" \
+        -C "$INSTALL_DIR" .env docker-compose.yml \
+        -C "$backup_dir" $([ -f "$db_dump" ] && basename "$db_dump") $([ -f "$instances_tar" ] && basename "$instances_tar") 2>/dev/null || true
+
+    rm -f "$db_dump" "$instances_tar"
+
+    if [ -f "$b_file" ]; then
+        ok "Backup created successfully: $b_file"
+        info "Archive contains: .env, docker-compose.yml, PostgreSQL database dump, and WhatsApp session instances."
+    else
+        err "Backup creation failed."
+        exit 1
+    fi
+    exit 0
+}
+
+action_uninstall() {
+    print_banner
+    print_section "Evolution API Uninstallation"
+
+    if [ ! -d "$INSTALL_DIR" ]; then
+        err "Installation directory $INSTALL_DIR does not exist."
+        exit 1
+    fi
+
+    warn "This will stop and remove the Evolution API stack."
+    if ! ask "Are you sure you want to proceed with uninstallation?"; then
+        info "Uninstallation cancelled."
+        exit 0
+    fi
+
+    detect_compose || true
+    if [ -n "$COMPOSE_CMD" ] && [ -f "${INSTALL_DIR}/docker-compose.yml" ]; then
+        info "Stopping and removing containers..."
+        cd "$INSTALL_DIR" && $COMPOSE_CMD down 2>/dev/null || true
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/evolution-api.service" ]; then
+        info "Disabling systemd service..."
+        run_elevated systemctl stop evolution-api.service 2>/dev/null || true
+        run_elevated systemctl disable evolution-api.service 2>/dev/null || true
+        run_elevated rm -f "/etc/systemd/system/evolution-api.service"
+        run_elevated systemctl daemon-reload 2>/dev/null || true
+        ok "Removed systemd service."
+    fi
+
+    printf '\n'
+    if ask "Do you want to permanently delete all persistent data volumes (database, instances, messages)?"; then
+        if command -v docker >/dev/null 2>&1; then
+            docker volume rm evolution_instances evolution_store evolution_postgres_data evolution_redis_data 2>/dev/null || true
+            ok "Docker persistent volumes removed."
+        fi
+        run_elevated rm -rf "$INSTALL_DIR"
+        ok "Removed directory: $INSTALL_DIR"
+    else
+        ok "Persistent Docker volumes preserved. Only configuration files removed."
+        run_elevated rm -f "${INSTALL_DIR}/docker-compose.yml"
+    fi
+
+    ok "Evolution API uninstalled successfully."
+    exit 0
+}
+
+# -----------------------------------------------------------------------------
+# Main Installation Flow
+# -----------------------------------------------------------------------------
+main_install() {
+    acquire_lock
+    print_banner
+
+    # 1. Platform & OS Checks
+    print_section "System Prerequisites"
+    check_platform || exit 1
+    check_system_resources
+
+    # 2. Interactive Prompts (if not -y)
+    if [ "$ASSUME_YES" -eq 0 ] && [ "$CHECK_ONLY" -eq 0 ]; then
+        print_section "Installation Configuration"
+        prompt_value "Installation directory" "$DEFAULT_INSTALL_DIR" INSTALL_DIR
+        prompt_value "HTTP port for Evolution API" "$DEFAULT_PORT" EVOLUTION_PORT
+        
+        local auto_url
+        auto_url="$(detect_server_url "$EVOLUTION_PORT")"
+        prompt_value "Server URL (used for webhooks and instances)" "$auto_url" SERVER_URL
+
+        local gen_key
+        gen_key="$(generate_secret 64)"
+        prompt_value "Global Authentication API Key" "$gen_key" AUTHENTICATION_API_KEY
+    fi
+
+    # Normalize directory path (convert Windows backslashes to Linux forward slashes, trim trailing slash)
+    INSTALL_DIR="${INSTALL_DIR//\\//}"
+    INSTALL_DIR="${INSTALL_DIR%/}"
+    [ -n "$INSTALL_DIR" ] || INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+
+    # 3. Port conflict check
+    if ! check_port_available "$EVOLUTION_PORT"; then
+        warn "Port ${EVOLUTION_PORT} appears to be in use by another process."
+        if [ "$CHECK_ONLY" -eq 0 ] && ! ask "Continue anyway with port ${EVOLUTION_PORT}?"; then
+            err "Installation aborted due to port conflict."
+            exit 1
+        fi
+    else
+        ok "Port ${EVOLUTION_PORT} is available."
+    fi
+
+    # 4. Docker Environment
+    ensure_docker_environment || {
+        if [ "$CHECK_ONLY" -eq 1 ]; then
+            printf '\n'
+            warn "System check completed: Docker is missing and will be installed during setup."
+            info "To proceed with full installation, run: $0"
+            exit 0
+        fi
+        exit 1
+    }
+
+    # If check-only mode, stop here
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        printf '\n'
+        ok "Pre-flight checks completed. System is ready for Evolution API."
+        info "To execute the full installation, run: $0"
+        exit 0
+    fi
+
+    # Confirmation before making changes
+    if [ "$ASSUME_YES" -eq 0 ]; then
+        printf '\n'
+        info "Summary of installation:"
+        printf '    %s: %s\n' "Directory" "$INSTALL_DIR"
+        printf '    %s: %s\n' "Port" "$EVOLUTION_PORT"
+        printf '    %s: %s\n' "Server URL" "${SERVER_URL:-$(detect_server_url "$EVOLUTION_PORT")}"
+        printf '    %s: %s\n' "Image" "$EVOLUTION_IMAGE"
+        printf '\n'
+        if ! ask "Proceed with installation and container startup?"; then
+            warn "Installation cancelled by user."
+            exit 0
+        fi
+    fi
+
+    # 5. Generate configuration
+    generate_configuration_files
+
+    # 6. Setup systemd unit
+    setup_systemd_service
+
+    # 7. Deploy containers & check health
+    deploy_stack
+
+    # 8. Post-install Summary
+    print_section "Installation Complete"
+    ok "Evolution API has been successfully installed and launched!"
+    printf '\n'
+    printf '  %s\n' "${C_BOLD}Access & Authentication Details:${C_RESET}"
+    printf '    %s %s\n' "API URL    :" "${C_CYAN}${SERVER_URL}${C_RESET}"
+    printf '    %s %s\n' "Healthcheck:" "${C_CYAN}${SERVER_URL}/${C_RESET}"
+    printf '    %s %s\n' "API Docs   :" "${C_CYAN}${SERVER_URL}/docs${C_RESET}"
+    printf '    %s %s\n' "API Key    :" "${C_YELLOW}${AUTHENTICATION_API_KEY}${C_RESET}"
+    printf '\n'
+    printf '  %s\n' "${C_BOLD}Architecture & Storage:${C_RESET}"
+    printf '    %s %s\n' "Config Dir :" "${INSTALL_DIR}"
+    printf '    %s %s\n' "PostgreSQL :" "evolution_postgres (internal Docker network)"
+    printf '    %s %s\n' "Redis Cache:" "evolution_redis (internal Docker network, AOF enabled)"
+    printf '    %s %s\n' "Persistence:" "Docker named volumes (evolution_instances, evolution_postgres_data)"
+    printf '\n'
+    printf '  %s\n' "${C_BOLD}Management Commands:${C_RESET}"
+    printf '    %s\n' "Check status:  $0 --status"
+    printf '    %s\n' "View logs:     $0 --logs"
+    printf '    %s\n' "Restart stack: $0 --restart"
+    printf '    %s\n' "Stop stack:    $0 --stop"
+    printf '    %s\n' "Start stack:   $0 --start"
+    printf '    %s\n' "Create backup: $0 --backup"
+    if [ "$INSTALL_SYSTEMD" -eq 1 ]; then
+        printf '    %s\n' "Systemd:       sudo systemctl status evolution-api"
+    fi
+    printf '\n'
+    log "Evolution API installer completed. Maintainer: Inova e-Business"
+    printf '\n'
+}
+
+# -----------------------------------------------------------------------------
+# Dispatch Action
+# -----------------------------------------------------------------------------
+case "$ACTION" in
+    status)    action_status ;;
+    start)     action_start ;;
+    stop)      action_stop ;;
+    restart)   action_restart ;;
+    logs)      action_logs ;;
+    backup)    action_backup ;;
+    uninstall) action_uninstall ;;
+    check)     main_install ;;
+    install)   main_install ;;
+    *)         err "Unknown action: $ACTION"; usage; exit 1 ;;
+esac
