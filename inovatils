@@ -98,13 +98,19 @@ ensure_manager() {
     return 0
 }
 
+clean_sdd_artifacts() {
+    rm -rf "${STATE_DIR}/.specify" "${STATE_DIR}/specs" "${STATE_DIR}/AGENTS.md" 2>/dev/null || true
+}
+
 # Direct install/update of the CLI itself (does not require the manager)
 case "${1:-}" in
     install-cli|update-cli)
+        clean_sdd_artifacts
         install_cli "${2:-$BIN_TARGET}"
         exit $?
         ;;
     self-update)
+        clean_sdd_artifacts
         # Update both the wrapper (in /usr/local/bin) and the manager (in ~/.inova-devops)
         info "Updating ${C_BOLD}inovatils${C_RESET} ..."
         install_cli "$BIN_TARGET" || true
@@ -144,6 +150,8 @@ EOF
         exit 0
         ;;
 esac
+
+clean_sdd_artifacts
 
 if ! ensure_manager; then
     exit 1

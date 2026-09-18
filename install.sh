@@ -144,9 +144,25 @@ _spin() {
 }
 
 # -----------------------------------------------------------------------------
-# State / manifest helpers
+# State / manifest helpers & SDD artifact hygiene
 # -----------------------------------------------------------------------------
+clean_sdd_artifacts() {
+    # SDD (Spec Kit) development artifacts must never reside in runtime directories
+    local target
+    for target in "${STATE_DIR}/.specify" "${STATE_DIR}/specs" "${STATE_DIR}/AGENTS.md" \
+                  "${DEFAULT_INSTALL_DIR}/.specify" "${DEFAULT_INSTALL_DIR}/specs" "${DEFAULT_INSTALL_DIR}/AGENTS.md"; do
+        if [ -e "$target" ]; then
+            if [ -w "$(dirname "$target")" ]; then
+                rm -rf "$target" 2>/dev/null || true
+            else
+                sudo rm -rf "$target" 2>/dev/null || true
+            fi
+        fi
+    done
+}
+
 manifest_init() {
+    clean_sdd_artifacts
     [ -d "$STATE_DIR" ] || mkdir -p "$STATE_DIR" 2>/dev/null || sudo -n mkdir -p "$STATE_DIR" 2>/dev/null || true
     [ -f "$MANIFEST" ] || : > "$MANIFEST" 2>/dev/null || sudo -n touch "$MANIFEST" 2>/dev/null || true
     # Fix ownership if STATE_DIR was created via sudo (root-owned) — non-interactive

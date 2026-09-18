@@ -1,0 +1,25 @@
+# ai agent local config
+/.agents/
+/.agy/
+/.amp/
+/.augment/
+/.auggie/
+/.bob/
+/.claude/
+/.codebuddy/
+/.codex/
+/.cursor/
+/.devin/
+/.forge/
+/.gemini/
+/.github/
+/.github/agents/
+/.github/prompts/
+/.github/skills/
+/.goose/
+/.iflow/
+/.junie/
+/.kilocode/
+/.kimi/
+/.myagent/
+/.vscode/
