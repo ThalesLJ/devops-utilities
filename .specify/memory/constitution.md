@@ -15,7 +15,7 @@
 - **Shell Compatibility:** All scripts must begin with `#!/bin/bash` and implement automatic re-execution under Bash if inadvertently invoked via `sh`, `dash`, or `ash`.
 - **Strict Mode:** Mandatory enforcement of `set -uo pipefail` to prevent uninitialized variables and masked pipeline failures.
 - **Concurrency Control (Locking):** Maintenance and service scripts must employ exclusive directory locks (e.g., `/tmp/<name>.lock`) with guaranteed cleanup via `trap 'rmdir ...' EXIT`.
-- **Principle of Least Privilege:** Execution must start in the caller's user context, elevating privileges via `sudo` exclusively for steps requiring root access (writing to `/usr/local/sbin`, `/etc`, system package managers, and `systemctl`).
+- **Principle of Least Privilege & Service User Isolation:** Execution must start in the caller's user context, elevating privileges via `sudo` exclusively for steps requiring root access (writing to `/usr/local/sbin`, `/etc`, system package managers, and `systemctl`). All service installation and lifecycle scripts must create and employ dedicated, unprivileged system users (e.g., `docker-user`, `evolution-user`) without interactive login shells (`/usr/sbin/nologin`) to own service directories and govern runtime execution, isolating service workloads from root permissions.
 
 ### III. Installation Standards (`install`)
 - **Pre-flight Environment Checks:**
@@ -24,7 +24,7 @@
   - Package manager integrity (`apt`, `dnf`, `pacman`), system lock validation, and network reachability to official package repositories.
 - **Intelligent State Detection:** Default execution without arguments must inspect system state: if the component is missing, it automatically initiates a clean installation; if already present, it reports status or transitions to the safe update workflow.
 - **Safe Automation:** Mandatory support for `-y` / `--yes` (unattended execution using secure, hardened defaults) and `-c` / `--check-only` (dry-run diagnostics without modifying the host).
-- **Security Hardening:** Cryptographically secure credential generation (passwords, API keys), restricted service users/groups, strict file permissions (`chmod 600` for `.env`), and isolated container networking.
+- **Security Hardening & User Isolation:** Cryptographically secure credential generation (passwords, API keys), mandatory provisioning of isolated system service users/groups (e.g., `docker-user`, `evolution-user`), strict file permissions (`chmod 600` for `.env`, `chmod 750` for service directories), container security constraints (`no-new-privileges`, capability drop), and isolated container networking.
 
 ### IV. Safe Update Standards (`update`)
 - **Pre-Update State Snapshot:** Prior to applying any updates, scripts must generate a comprehensive plain-text runtime snapshot (.txt) under `/var/log/inova-devops/` capturing running containers, exposed ports, volumes, images, and disk utilization.
@@ -74,4 +74,4 @@ All service and utility scripts must adhere to standard CLI actions and flags:
 - This constitution establishes the non-negotiable architectural and quality principles for all scripts and utilities in the `devops-utilities` repository.
 - Any modifications to execution patterns or new features must be formalized in this constitution before code implementation.
 
-**Version**: 1.0.0 | **Ratified**: 2026-09-18 | **Last Amended**: 2026-09-18
+**Version**: 1.1.0 | **Ratified**: 2026-09-18 | **Last Amended**: 2026-09-21

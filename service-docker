@@ -788,6 +788,88 @@ setup_official_repository() {
     return 0
 }
 
+# -----------------------------------------------------------------------------
+# System User & Daemon Baseline Configuration
+# -----------------------------------------------------------------------------
+setup_docker_system_user() {
+    info "Configuring dedicated system user 'docker-user'..."
+    if ! getent group docker >/dev/null 2>&1; then
+        run_elevated groupadd docker 2>/dev/null || true
+    fi
+
+    if id "docker-user" >/dev/null 2>&1; then
+        ok "System user 'docker-user' already exists."
+    else
+        if run_elevated useradd -r -s /usr/sbin/nologin -M -c "Docker Service User" docker-user 2>/dev/null; then
+            ok "Created unprivileged system user 'docker-user'."
+        else
+            warn "Failed to create system user 'docker-user'."
+        fi
+    fi
+
+    if id "docker-user" >/dev/null 2>&1; then
+        run_elevated usermod -aG docker docker-user 2>/dev/null || true
+        ok "Added 'docker-user' to 'docker' group."
+    fi
+}
+
+configure_docker_daemon() {
+    print_section "Configuring Docker Daemon Baseline"
+    local daemon_json="/etc/docker/daemon.json"
+    run_elevated mkdir -p /etc/docker
+
+    local tmp_json
+    tmp_json="$(mktemp)"
+
+    if [ -f "$daemon_json" ]; then
+        info "Existing $daemon_json detected. Creating backup before applying baseline..."
+        run_elevated cp "$daemon_json" "${daemon_json}.bak-${START_TS}"
+        
+        # Merge baseline settings idempotently using python3/python if available
+        if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then
+            local py_cmd="python3"
+            command -v python3 >/dev/null 2>&1 || py_cmd="python"
+            $py_cmd -c "
+import json, sys
+try:
+    with open('$daemon_json') as f:
+        data = json.load(f)
+except Exception:
+    data = {}
+data['live-restore'] = True
+data['log-driver'] = 'json-file'
+log_opts = data.get('log-opts', {})
+log_opts.setdefault('max-size', '20m')
+log_opts.setdefault('max-file', '3')
+data['log-opts'] = log_opts
+data['userland-proxy'] = False
+with open('$tmp_json', 'w') as f:
+    json.dump(data, f, indent=2)
+" 2>/dev/null || true
+        fi
+    fi
+
+    # Fallback to write standard baseline if tmp_json is empty
+    if [ ! -s "$tmp_json" ]; then
+        cat <<'EOF' > "$tmp_json"
+{
+  "live-restore": true,
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "20m",
+    "max-file": "3"
+  },
+  "userland-proxy": false
+}
+EOF
+    fi
+
+    run_elevated cp "$tmp_json" "$daemon_json"
+    run_elevated chmod 644 "$daemon_json"
+    rm -f "$tmp_json"
+    ok "Docker daemon configuration applied (/etc/docker/daemon.json)."
+}
+
 perform_install_or_update() {
     local is_update=0
     if command -v docker >/dev/null 2>&1; then
@@ -841,6 +923,12 @@ perform_install_or_update() {
         err "Package manager update failed with exit code $rc."
         return $rc
     fi
+
+    # Configure Docker daemon baseline (/etc/docker/daemon.json)
+    configure_docker_daemon
+
+    # Ensure system user docker-user exists
+    setup_docker_system_user
 
     # Ensure systemd services are enabled and started
     if command -v systemctl >/dev/null 2>&1; then
@@ -1109,6 +1197,25 @@ action_status() {
 
     if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
         ok "Daemon Status : Active and responding"
+        
+        # Check daemon.json and live-restore
+        local lr_status="disabled"
+        if [ -f /etc/docker/daemon.json ]; then
+            if grep -qi '"live-restore"[[:space:]]*:[[:space:]]*true' /etc/docker/daemon.json 2>/dev/null; then
+                lr_status="enabled"
+            fi
+            info "Daemon Config : /etc/docker/daemon.json (live-restore: $lr_status)"
+        else
+            warn "Daemon Config : /etc/docker/daemon.json not present"
+        fi
+
+        # Check docker-user
+        if id "docker-user" >/dev/null 2>&1; then
+            info "Service User  : docker-user (active)"
+        else
+            warn "Service User  : docker-user (not configured)"
+        fi
+
         printf '\n'
         info "Docker System Storage:"
         docker system df 2>&1

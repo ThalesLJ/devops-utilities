@@ -64,7 +64,7 @@ EVOLUTION_PORT="$DEFAULT_PORT"
 SERVER_URL=""
 AUTHENTICATION_API_KEY=""
 
-DEFAULT_IMAGE="evoapicloud/evolution-api:latest"
+DEFAULT_IMAGE="evoapicloud/evolution-api:v2.3.7"
 EVOLUTION_IMAGE="$DEFAULT_IMAGE"
 
 POSTGRES_VERSION="15-alpine"
@@ -324,7 +324,7 @@ Installation Options:
       --port PORT         HTTP port to bind (default: 8080).
       --api-key KEY       Custom global API key (auto-generated 64-char key if unset).
       --server-url URL    External or public server URL (auto-detected if unset).
-      --image IMAGE       Evolution API Docker image (default: evoapicloud/evolution-api:latest).
+      --image IMAGE       Evolution API Docker image (default: evoapicloud/evolution-api:v2.3.7).
       --no-systemd        Do not install systemd service unit.
 
 Management & Lifecycle Actions:
@@ -534,17 +534,44 @@ ensure_docker_environment() {
 }
 
 # -----------------------------------------------------------------------------
-# Configuration Generation (.env and docker-compose.yml)
+# System User & Configuration Generation (.env and docker-compose.yml)
 # -----------------------------------------------------------------------------
+setup_evolution_system_user() {
+    info "Configuring dedicated system user 'evolution-user'..."
+    if ! getent group docker >/dev/null 2>&1; then
+        run_elevated groupadd docker 2>/dev/null || true
+    fi
+
+    if id "evolution-user" >/dev/null 2>&1; then
+        ok "System user 'evolution-user' already exists."
+    else
+        if run_elevated useradd -r -s /usr/sbin/nologin -d "$INSTALL_DIR" -M -c "Evolution API Service User" evolution-user 2>/dev/null; then
+            ok "Created unprivileged system user 'evolution-user'."
+        else
+            warn "Failed to create system user 'evolution-user'."
+        fi
+    fi
+
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated usermod -aG docker evolution-user 2>/dev/null || true
+        ok "Added 'evolution-user' to 'docker' group."
+    fi
+}
+
 generate_configuration_files() {
     print_section "Generating Configuration"
+
+    # Ensure dedicated unprivileged service account exists
+    setup_evolution_system_user
 
     info "Creating target directory: $INSTALL_DIR"
     run_elevated mkdir -p "$INSTALL_DIR"
     run_elevated chmod 750 "$INSTALL_DIR"
 
-    # Set appropriate ownership if invoked with sudo
-    if [ -n "${SUDO_USER:-}" ]; then
+    # Set appropriate ownership to evolution-user
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated chown -R evolution-user:evolution-user "$INSTALL_DIR" 2>/dev/null || true
+    elif [ -n "${SUDO_USER:-}" ]; then
         run_elevated chown -R "${SUDO_USER}:${SUDO_USER}" "$INSTALL_DIR" 2>/dev/null || true
     fi
 
@@ -556,6 +583,7 @@ generate_configuration_files() {
 
     local env_file="${INSTALL_DIR}/.env"
     local compose_file="${INSTALL_DIR}/docker-compose.yml"
+    local redis_conf="${INSTALL_DIR}/redis.conf"
 
     # Check if .env already exists to preserve existing credentials
     if [ -f "$env_file" ]; then
@@ -582,7 +610,7 @@ SERVER_URL=${SERVER_URL}
 
 # Authentication
 AUTHENTICATION_API_KEY=${AUTHENTICATION_API_KEY}
-AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=false
 
 # Database Settings (PostgreSQL)
 DATABASE_ENABLED=true
@@ -616,6 +644,17 @@ LOG_LEVEL=ERROR,WARN,INFO
 LOG_COLOR=true
 LOG_BAILEYS=error
 
+# Resource Limits & Tuning (~10 Instances Target Profile)
+EVOLUTION_MEM_LIMIT=2048m
+EVOLUTION_MEM_RESERVE=512m
+EVOLUTION_CPUS=1.5
+POSTGRES_MEM_LIMIT=512m
+POSTGRES_MEM_RESERVE=128m
+POSTGRES_CPUS=1.0
+REDIS_MEM_LIMIT=256m
+REDIS_MEM_RESERVE=64m
+REDIS_CPUS=0.5
+
 # Internal Container Credentials
 POSTGRES_USER=${POSTGRES_USER}
 POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
@@ -627,7 +666,22 @@ EOF
 
     # Security best practice: lock down .env permissions
     chmod 600 "$env_file"
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated chown evolution-user:evolution-user "$env_file" 2>/dev/null || true
+    fi
     ok "Wrote environment file with restricted permissions (chmod 600)."
+
+    # Write Redis configuration file to protect credentials from ps aux
+    info "Writing Redis configuration (redis.conf)..."
+    cat <<EOF > "$redis_conf"
+appendonly yes
+requirepass ${REDIS_PASSWORD}
+EOF
+    chmod 640 "$redis_conf"
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated chown evolution-user:evolution-user "$redis_conf" 2>/dev/null || true
+    fi
+    ok "Wrote Redis configuration with shielded credentials."
 
     info "Writing docker-compose.yml..."
     cat <<'EOF' > "$compose_file"
@@ -635,9 +689,18 @@ version: '3.8'
 
 services:
   evolution-api:
-    image: ${EVOLUTION_IMAGE:-evoapicloud/evolution-api:latest}
+    image: ${EVOLUTION_IMAGE:-evoapicloud/evolution-api:v2.3.7}
     container_name: evolution_api
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: ${EVOLUTION_MEM_LIMIT:-2048m}
+          cpus: '${EVOLUTION_CPUS:-1.5}'
+        reservations:
+          memory: ${EVOLUTION_MEM_RESERVE:-512m}
     ports:
       - "${EVOLUTION_PORT:-8080}:8080"
     env_file:
@@ -683,7 +746,7 @@ services:
         max-size: "20m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8080/ || exit 1"]
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:8080/', (r) => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -693,6 +756,15 @@ services:
     image: postgres:15-alpine
     container_name: evolution_postgres
     restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: ${POSTGRES_MEM_LIMIT:-512m}
+          cpus: '${POSTGRES_CPUS:-1.0}'
+        reservations:
+          memory: ${POSTGRES_MEM_RESERVE:-128m}
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
@@ -717,11 +789,21 @@ services:
     image: redis:7-alpine
     container_name: evolution_redis
     restart: unless-stopped
-    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD}"]
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: ${REDIS_MEM_LIMIT:-256m}
+          cpus: '${REDIS_CPUS:-0.5}'
+        reservations:
+          memory: ${REDIS_MEM_RESERVE:-64m}
+    command: ["redis-server", "/usr/local/etc/redis/redis.conf"]
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
+      - ./redis.conf:/usr/local/etc/redis/redis.conf:ro
     networks:
       - evolution-net
     logging:
@@ -730,7 +812,7 @@ services:
         max-size: "20m"
         max-file: "3"
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping 2>/dev/null | grep -q PONG || redis-cli ping 2>/dev/null | grep -q PONG"]
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping 2>/dev/null | grep -q PONG || redis-cli ping 2>/dev/null | grep -q PONG"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -753,11 +835,14 @@ networks:
 EOF
 
     chmod 644 "$compose_file"
-    ok "Wrote docker-compose.yml with production healthchecks and log rotation."
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated chown evolution-user:evolution-user "$compose_file" 2>/dev/null || true
+    fi
+    ok "Wrote docker-compose.yml with production healthchecks, resource limits and log rotation."
 }
 
 # -----------------------------------------------------------------------------
-# Systemd Service Unit
+# Systemd Service Units & Automated Backup Timer
 # -----------------------------------------------------------------------------
 setup_systemd_service() {
     if [ "$INSTALL_SYSTEMD" -ne 1 ] || ! command -v systemctl >/dev/null 2>&1; then
@@ -786,6 +871,8 @@ Wants=network-online.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
+User=evolution-user
+Group=evolution-user
 WorkingDirectory=${INSTALL_DIR}
 ExecStart=${compose_exec} up -d --remove-orphans
 ExecStop=${compose_exec} down
@@ -802,7 +889,74 @@ EOF
 
     run_elevated systemctl daemon-reload 2>/dev/null || true
     run_elevated systemctl enable evolution-api.service 2>/dev/null || true
-    ok "Systemd service 'evolution-api.service' created and enabled on boot."
+    ok "Systemd service 'evolution-api.service' created (User=evolution-user) and enabled on boot."
+}
+
+setup_systemd_backup_timer() {
+    local backup_svc="/etc/systemd/system/evolution-api-backup.service"
+    local backup_tmr="/etc/systemd/system/evolution-api-backup.timer"
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        if [ -d /etc/cron.daily ]; then
+            info "Configuring daily backup cron job (/etc/cron.daily/evolution-api-backup)..."
+            cat <<'EOF' > /tmp/evolution-api-backup-cron
+#!/bin/bash
+if [ -x /usr/local/sbin/service-evolution-api ]; then
+    /usr/local/sbin/service-evolution-api --backup >/dev/null 2>&1
+fi
+EOF
+            run_elevated cp /tmp/evolution-api-backup-cron /etc/cron.daily/evolution-api-backup
+            run_elevated chmod 755 /etc/cron.daily/evolution-api-backup
+            rm -f /tmp/evolution-api-backup-cron
+            ok "Daily backup scheduled via /etc/cron.daily (03:00)."
+        fi
+        return 0
+    fi
+
+    info "Configuring daily automated backup timer ($backup_tmr)..."
+
+    local script_cmd="/usr/local/sbin/service-evolution-api"
+    if [ ! -x "$script_cmd" ]; then
+        script_cmd="$(readlink -f "$0" 2>/dev/null || echo "$0")"
+    fi
+
+    local tmp_svc
+    tmp_svc="$(mktemp)"
+    cat <<EOF > "$tmp_svc"
+[Unit]
+Description=Evolution API Daily Volume Backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/bin/bash ${script_cmd} --backup
+EOF
+    run_elevated cp "$tmp_svc" "$backup_svc"
+    run_elevated chmod 644 "$backup_svc"
+    rm -f "$tmp_svc"
+
+    local tmp_tmr
+    tmp_tmr="$(mktemp)"
+    cat <<EOF > "$tmp_tmr"
+[Unit]
+Description=Trigger Daily Evolution API Volume Backup (03:00)
+
+[Timer]
+OnCalendar=*-*-* 03:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+    run_elevated cp "$tmp_tmr" "$backup_tmr"
+    run_elevated chmod 644 "$backup_tmr"
+    rm -f "$tmp_tmr"
+
+    run_elevated systemctl daemon-reload 2>/dev/null || true
+    run_elevated systemctl enable --now evolution-api-backup.timer 2>/dev/null || true
+    ok "Automated daily backup timer 'evolution-api-backup.timer' enabled on boot (03:00 daily)."
 }
 
 # -----------------------------------------------------------------------------
@@ -899,6 +1053,28 @@ action_status() {
         local sys_status
         sys_status="$(systemctl is-active evolution-api.service 2>/dev/null || echo inactive)"
         info "Systemd service (evolution-api.service): $sys_status"
+    fi
+
+    # Check dedicated system user
+    if id "evolution-user" >/dev/null 2>&1; then
+        info "Service User    : evolution-user (isolated system account)"
+    else
+        warn "Service User    : evolution-user (not configured)"
+    fi
+
+    # Check backups and backup timer
+    if [ -d "${INSTALL_DIR}/backups" ]; then
+        local b_cnt
+        b_cnt="$(ls -1 "${INSTALL_DIR}/backups"/evolution-api-backup-*.tar.gz 2>/dev/null | wc -l | tr -d ' ')"
+        info "Stored Backups  : $b_cnt (retention limit: 10 archives)"
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+        local tmr_st
+        tmr_st="$(systemctl is-active evolution-api-backup.timer 2>/dev/null || echo inactive)"
+        info "Backup Timer    : $tmr_st (evolution-api-backup.timer - 03:00 daily)"
+    elif [ -f /etc/cron.daily/evolution-api-backup ]; then
+        info "Backup Schedule : /etc/cron.daily/evolution-api-backup (daily at 03:00)"
     fi
 
     printf '\n'
@@ -999,11 +1175,15 @@ action_logs() {
 create_backup() {
     local backup_dir="${INSTALL_DIR}/backups"
     mkdir -p "$backup_dir"
+    if id "evolution-user" >/dev/null 2>&1; then
+        run_elevated chown -R evolution-user:evolution-user "$backup_dir" 2>/dev/null || true
+    fi
 
     local b_ts
     b_ts="$(date +%Y%m%d-%H%M%S)"
     local b_file="${backup_dir}/evolution-api-backup-${b_ts}.tar.gz"
     local db_dump="${backup_dir}/evolution-db-${b_ts}.sql"
+    local db_cold_tar="${backup_dir}/evolution-db-cold-${b_ts}.tar.gz"
 
     # Extract database credentials from .env
     local db_user db_name db_pass
@@ -1014,13 +1194,27 @@ create_backup() {
     info "Exporting PostgreSQL database..."
     if docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^evolution_postgres$"; then
         if docker exec -e PGPASSWORD="$db_pass" evolution_postgres pg_dump -U "$db_user" "$db_name" > "$db_dump" 2>/dev/null; then
-            ok "Database dumped to $db_dump"
+            ok "Live database dumped to $db_dump"
         else
-            warn "Failed to execute pg_dump inside evolution_postgres container."
+            warn "Failed to execute live pg_dump inside evolution_postgres container."
             rm -f "$db_dump"
         fi
     else
-        warn "evolution_postgres container is not running; skipping live database dump."
+        warn "evolution_postgres container is not running; falling back to cold database backup."
+    fi
+
+    # Fallback to cold volume backup if live pg_dump was not produced
+    if [ ! -f "$db_dump" ]; then
+        info "Performing cold backup of evolution_postgres_data volume..."
+        if docker volume inspect evolution_postgres_data >/dev/null 2>&1; then
+            docker run --rm \
+                -v evolution_postgres_data:/var/lib/postgresql/data:ro \
+                -v "$backup_dir":/backup \
+                alpine tar -czf "/backup/evolution-db-cold-${b_ts}.tar.gz" -C /var/lib/postgresql/data . 2>/dev/null || true
+            [ -f "$db_cold_tar" ] && ok "Cold database volume archived to $db_cold_tar"
+        else
+            warn "evolution_postgres_data volume not found; skipping cold volume backup."
+        fi
     fi
 
     # Backup instances volume using a temporary alpine container
@@ -1034,18 +1228,51 @@ create_backup() {
         [ -f "$instances_tar" ] && ok "Instances archived to $instances_tar"
     fi
 
-    info "Creating compressed final archive ($b_file)..."
-    tar -czf "$b_file" \
-        -C "$INSTALL_DIR" .env docker-compose.yml \
-        -C "$backup_dir" $([ -f "$db_dump" ] && basename "$db_dump") $([ -f "$instances_tar" ] && basename "$instances_tar") 2>/dev/null || true
+    # Backup store volume if present
+    local store_tar="${backup_dir}/store-${b_ts}.tar.gz"
+    if docker volume inspect evolution_store >/dev/null 2>&1; then
+        docker run --rm \
+            -v evolution_store:/store:ro \
+            -v "$backup_dir":/backup \
+            alpine tar -czf "/backup/store-${b_ts}.tar.gz" -C /store . 2>/dev/null || true
+        [ -f "$store_tar" ] && ok "Media store archived to $store_tar"
+    fi
 
-    rm -f "$db_dump" "$instances_tar"
+    info "Creating compressed final archive ($b_file)..."
+    local config_files=(".env" "docker-compose.yml")
+    [ -f "${INSTALL_DIR}/redis.conf" ] && config_files+=("redis.conf")
+
+    tar -czf "$b_file" \
+        -C "$INSTALL_DIR" "${config_files[@]}" \
+        -C "$backup_dir" $([ -f "$db_dump" ] && basename "$db_dump") $([ -f "$db_cold_tar" ] && basename "$db_cold_tar") $([ -f "$instances_tar" ] && basename "$instances_tar") $([ -f "$store_tar" ] && basename "$store_tar") 2>/dev/null || true
+
+    rm -f "$db_dump" "$db_cold_tar" "$instances_tar" "$store_tar"
 
     if [ -f "$b_file" ]; then
         chmod 600 "$b_file" 2>/dev/null || true
+        if id "evolution-user" >/dev/null 2>&1; then
+            run_elevated chown evolution-user:evolution-user "$b_file" 2>/dev/null || true
+        fi
         LATEST_BACKUP_FILE="$b_file"
         ok "Backup created successfully: $b_file"
-        info "Archive contains: .env, docker-compose.yml, PostgreSQL database dump, and WhatsApp session instances."
+        info "Archive contains: configuration files (.env, docker-compose.yml), database snapshot, and WhatsApp session instances."
+
+        # Enforce retention policy: strictly maintain maximum 10 backup archives
+        local all_backups
+        # shellcheck disable=SC2012
+        all_backups="$(ls -1t "${backup_dir}"/evolution-api-backup-*.tar.gz 2>/dev/null || true)"
+        local total_backups
+        total_backups="$(echo "$all_backups" | grep -c 'evolution-api-backup-' || echo 0)"
+        if [ "$total_backups" -gt 10 ]; then
+            info "Enforcing retention limit: keeping 10 most recent backups (found $total_backups)..."
+            echo "$all_backups" | tail -n +"$(( 10 + 1 ))" | while IFS= read -r old_file; do
+                if [ -n "$old_file" ] && [ -f "$old_file" ]; then
+                    rm -f "$old_file"
+                    info "Pruned old backup: $(basename "$old_file")"
+                fi
+            done
+        fi
+
         return 0
     else
         err "Backup creation failed."
@@ -1266,6 +1493,19 @@ action_snapshot() {
     exit 0
 }
 
+discover_latest_evolution_tag() {
+    local repo="evoapicloud/evolution-api"
+    local found_tag=""
+    if command -v curl >/dev/null 2>&1; then
+        local api_resp
+        api_resp="$(curl -fsSL --max-time 6 "https://hub.docker.com/v2/repositories/${repo}/tags?page_size=25&ordering=last_updated" 2>/dev/null || true)"
+        if [ -n "$api_resp" ]; then
+            found_tag="$(echo "$api_resp" | grep -o '"name":"v2\.[0-9]\+\.[0-9]\+"' | head -n1 | cut -d'"' -f4 || true)"
+        fi
+    fi
+    echo "$found_tag"
+}
+
 action_update() {
     acquire_lock
     print_banner
@@ -1298,6 +1538,17 @@ action_update() {
     local target_image="$cur_image"
     if [ -n "$EVOLUTION_IMAGE" ] && [ "$EVOLUTION_IMAGE" != "$DEFAULT_IMAGE" ]; then
         target_image="$EVOLUTION_IMAGE"
+    else
+        info "Checking Docker Hub for the latest Evolution API release..."
+        local discovered_tag
+        discovered_tag="$(discover_latest_evolution_tag)"
+        if [ -n "$discovered_tag" ]; then
+            target_image="evoapicloud/evolution-api:${discovered_tag}"
+            ok "Discovered latest release: ${target_image}"
+        else
+            warn "Could not discover remote tag; using current image reference: ${cur_image}"
+            target_image="$cur_image"
+        fi
     fi
 
     info "Current Installation Details:"
@@ -1496,14 +1747,21 @@ action_uninstall() {
         run_elevated docker rmi -f evoapicloud/evolution-api:latest evoapicloud/evolution-api:v2.2.3 evoapicloud/evolution-api:v2.2.2 2>/dev/null || true
     fi
 
-    # 6. Desativar e remover serviço systemd
-    if command -v systemctl >/dev/null 2>&1 && [ -f "/etc/systemd/system/evolution-api.service" ]; then
-        info "Desativando e removendo serviço systemd (evolution-api.service)..."
-        run_elevated systemctl stop evolution-api.service 2>/dev/null || true
-        run_elevated systemctl disable evolution-api.service 2>/dev/null || true
-        run_elevated rm -f "/etc/systemd/system/evolution-api.service"
+    # 6. Desativar e remover serviços e timers systemd
+    if command -v systemctl >/dev/null 2>&1; then
+        info "Desativando e removendo serviço e timer de backup do systemd..."
+        run_elevated systemctl stop evolution-api-backup.timer 2>/dev/null || true
+        run_elevated systemctl disable evolution-api-backup.timer 2>/dev/null || true
+        run_elevated rm -f "/etc/systemd/system/evolution-api-backup.timer" "/etc/systemd/system/evolution-api-backup.service" 2>/dev/null || true
+
+        if [ -f "/etc/systemd/system/evolution-api.service" ]; then
+            run_elevated systemctl stop evolution-api.service 2>/dev/null || true
+            run_elevated systemctl disable evolution-api.service 2>/dev/null || true
+            run_elevated rm -f "/etc/systemd/system/evolution-api.service"
+        fi
         run_elevated systemctl daemon-reload 2>/dev/null || true
     fi
+    run_elevated rm -f "/etc/cron.daily/evolution-api-backup" 2>/dev/null || true
 
     # 7. Remover diretório de instalação
     if [ -d "$INSTALL_DIR" ]; then
@@ -1600,8 +1858,9 @@ main_install() {
     # 5. Generate configuration
     generate_configuration_files
 
-    # 6. Setup systemd unit
+    # 6. Setup systemd units & automated daily backup timer
     setup_systemd_service
+    setup_systemd_backup_timer
 
     # 7. Deploy containers & check health
     deploy_stack
