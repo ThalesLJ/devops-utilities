@@ -128,7 +128,7 @@ Can be verified by deploying the Evolution API container and executing `docker i
 - **FR-011**: The backup routine MUST enforce a retention limit of at most 10 backup archives in `${INSTALL_DIR}/backups/`, automatically deleting older archives.
 - **FR-012**: The backup routine MUST support cold backups of the persistent database volume (`evolution_postgres_data`) when the PostgreSQL container is not running.
 - **FR-013**: The Evolution API service healthcheck in `docker-compose.yml` MUST use native Node.js HTTP evaluation (`node -e "..."`) to eliminate dependency on `curl`.
-- **FR-014**: System MUST prevent exposure of Redis authentication passwords in plaintext command-line process tables (`ps aux`).
+- **FR-014**: System MUST prevent exposure of Redis authentication passwords in plaintext command-line process tables (`ps aux`) via shielded `redis.conf` with readable permissions (`chmod 644`) for the unprivileged in-container service while maintaining host-level traversal isolation (`chmod 750` on `$INSTALL_DIR`).
 - **FR-015**: System MUST apply container security options (`no-new-privileges: true` and capability drops where appropriate) across all compose stack services.
 - **FR-016**: The project constitution (`constitution.md`) MUST require that all service installation scripts use dedicated, isolated unprivileged system accounts.
 
