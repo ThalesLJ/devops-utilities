@@ -32,7 +32,7 @@
 
 set -uo pipefail
 
-VERSION="1.1"
+VERSION="1.2"
 
 REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
@@ -121,6 +121,34 @@ case "${1:-}" in
         fi
         exec bash "$MANAGER" self-update
         ;;
+    uninstall|u)
+        clean_sdd_artifacts
+        case "${2:-}" in
+            -y|--yes|--force|"")
+                if [ -f "$MANAGER" ]; then
+                    exec bash "$MANAGER" "$@"
+                fi
+                info "Manager not found. Cleaning up inovatils..."
+                if [ -f "$BIN_TARGET" ]; then
+                    if [ "$(id -u)" -eq 0 ] || [ -w "$(dirname "$BIN_TARGET")" ]; then
+                        rm -f "$BIN_TARGET" 2>/dev/null || true
+                    else
+                        sudo rm -f "$BIN_TARGET" 2>/dev/null || true
+                    fi
+                fi
+                rm -rf "$STATE_DIR" 2>/dev/null || true
+                ok "DevOps Utilities / Inovatils has been uninstalled."
+                info "All configured services (Docker, Evolution API, etc.) remain running."
+                exit 0
+                ;;
+            *)
+                if ! ensure_manager; then
+                    exit 1
+                fi
+                exec bash "$MANAGER" "$@"
+                ;;
+        esac
+        ;;
     -h|--help|help)
         cat <<EOF
 Inovatils v${VERSION} · ${REPO} (${BRANCH})
@@ -132,7 +160,7 @@ Usage:
   inovatils install                  install all available scripts
   inovatils install <script>         install a specific script
   inovatils i                        alias for "install"
-  inovatils uninstall                uninstall all available scripts
+  inovatils uninstall [-y]           completely uninstall inovatils and all devops-utilities
   inovatils uninstall <script>       uninstall a specific script
   inovatils u                        alias for "uninstall"
   inovatils update                   update all installed scripts

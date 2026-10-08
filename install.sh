@@ -47,7 +47,7 @@
 
 set -uo pipefail
 
-VERSION="2.11"
+VERSION="2.12"
 
 REPO="ThalesLJ/devops-utilities"
 BRANCH="main"
@@ -346,6 +346,107 @@ do_remove() {
     manifest_del "$name"
     log_event "Removed ${name}"
     ok "Removed ${C_BOLD}${name}${C_RESET}."
+}
+
+do_uninstall_toolchain() {
+    local assume_yes="${1:-0}"
+    local cli_target="/usr/local/bin/inovatils"
+
+    if [ "$assume_yes" -ne 1 ]; then
+        printf '\n'
+        printf '  %s%s%s%s%s\n' "$C_YELLOW" "$B_TL" "$(rep "$B_H" 58)" "$B_TR" "$C_RESET"
+        printf '  %s %s%s %-54s %s\n' "$C_YELLOW$B_V$C_RESET" "$C_YELLOW" "[!]" "DevOps Utilities / Inovatils Uninstallation" "$C_YELLOW$B_V$C_RESET"
+        printf '  %s%s%s%s%s\n' "$C_YELLOW" "$B_BL" "$(rep "$B_H" 58)" "$B_BR" "$C_RESET"
+        printf '\n'
+        printf '  %s\n' "${C_BOLD}The following will be completely removed:${C_RESET}"
+        printf '    %s•%s All deployed utility scripts in %s\n' "$C_RED" "$C_RESET" "${C_CYAN}${DEFAULT_INSTALL_DIR}${C_RESET}"
+        printf '    %s•%s Global CLI wrapper at %s\n' "$C_RED" "$C_RESET" "${C_CYAN}${cli_target}${C_RESET}"
+        printf '    %s•%s Manager script and state directory %s\n' "$C_RED" "$C_RESET" "${C_CYAN}${STATE_DIR}${C_RESET}"
+        printf '\n'
+        printf '  %s\n' "${C_BOLD}The following will NOT be affected and remain active:${C_RESET}"
+        printf '    %s•%s Docker Engine, dockerd daemon, and active containers\n' "$C_GREEN" "$C_RESET"
+        printf '    %s•%s Application data, configurations, volumes, and /opt directories\n' "$C_GREEN" "$C_RESET"
+        printf '    %s•%s Dedicated system users and permissions\n' "$C_GREEN" "$C_RESET"
+        printf '\n'
+
+        if ! ask "Are you sure you want to completely uninstall inovatils and devops-utilities?"; then
+            warn "Uninstallation cancelled."
+            return 0
+        fi
+    fi
+
+    printf '\n'
+    info "Starting complete uninstallation of DevOps Utilities / Inovatils ..."
+
+    # 1. Remove all deployed scripts
+    # From manifest:
+    if [ -f "$MANIFEST" ]; then
+        local name _ dir dest
+        while IFS='|' read -r name _ dir; do
+            [ -n "$name" ] || continue
+            [ -n "$dir" ] || dir="$DEFAULT_INSTALL_DIR"
+            dest="${dir}/${name}"
+            if [ -f "$dest" ]; then
+                info "Removing ${C_CYAN}${dest}${C_RESET} ..."
+                if [ "$(id -u)" -eq 0 ]; then
+                    rm -f "$dest" 2>/dev/null || true
+                else
+                    sudo rm -f "$dest" 2>/dev/null || true
+                fi
+            fi
+        done < "$MANIFEST"
+    fi
+
+    # Known repository scripts in DEFAULT_INSTALL_DIR (fallback for partial/broken manifest)
+    local known_scripts=(
+        "disk-health.sh"
+        "docker-cleanup.sh"
+        "opencode-installer.sh"
+        "service-docker"
+        "service-evolution-api"
+        "sys-update-checker.sh"
+        "threat-scan.sh"
+    )
+    for name in "${known_scripts[@]}"; do
+        dest="${DEFAULT_INSTALL_DIR}/${name}"
+        if [ -f "$dest" ]; then
+            if [ "$(id -u)" -eq 0 ]; then
+                rm -f "$dest" 2>/dev/null || true
+            else
+                sudo rm -f "$dest" 2>/dev/null || true
+            fi
+        fi
+    done
+    ok "Removed deployed utility scripts from ${DEFAULT_INSTALL_DIR}."
+
+    # 2. Remove CLI wrapper
+    if [ -f "$cli_target" ]; then
+        info "Removing ${C_CYAN}${cli_target}${C_RESET} ..."
+        if [ "$(id -u)" -eq 0 ]; then
+            rm -f "$cli_target" 2>/dev/null || true
+        else
+            sudo rm -f "$cli_target" 2>/dev/null || true
+        fi
+        ok "Removed ${C_BOLD}${cli_target}${C_RESET}."
+    fi
+
+    # 3. Remove state directories
+    if [ -d "$STATE_DIR" ]; then
+        rm -rf "$STATE_DIR" 2>/dev/null || sudo rm -rf "$STATE_DIR" 2>/dev/null || true
+    fi
+    if [ -n "${SUDO_USER:-}" ] && [ -d "/home/${SUDO_USER}/.inova-devops" ]; then
+        rm -rf "/home/${SUDO_USER}/.inova-devops" 2>/dev/null || sudo rm -rf "/home/${SUDO_USER}/.inova-devops" 2>/dev/null || true
+    fi
+    if [ -d "/root/.inova-devops" ]; then
+        sudo rm -rf "/root/.inova-devops" 2>/dev/null || rm -rf "/root/.inova-devops" 2>/dev/null || true
+    fi
+    ok "Removed state directory ${STATE_DIR}."
+
+    printf '\n'
+    ok "${C_BOLD}DevOps Utilities / Inovatils has been completely uninstalled.${C_RESET}"
+    info "All configured services (Docker, Evolution API, etc.) remain running."
+    printf '\n'
+    exit 0
 }
 
 do_update() {
@@ -721,7 +822,8 @@ print_actions() {
     printf '  %s%-5s%s %-22s%s%-5s%s %-26s\n' \
         "$C_BOLD" "l" "$C_RESET" "reload the list" \
         "$C_BOLD" "d" "$C_RESET" "expand/collapse details"
-    printf '  %s%-5s%s %-22s\n' \
+    printf '  %s%-5s%s %-22s%s%-5s%s %-26s\n' \
+        "$C_BOLD" "u" "$C_RESET" "uninstall inovatils" \
         "$C_BOLD" "q" "$C_RESET" "quit"
     printf '\n'
 }
@@ -770,6 +872,7 @@ arrow_menu() {
                 ;;
             a|A) printf '\n'; menu_update_all; load_scripts; expanded=0; back_to_menu ;;
             r|R) printf '\n'; do_remove "$(script_at "$sel")"; load_scripts; expanded=0; back_to_menu ;;
+            u|U) printf '\n'; do_uninstall_toolchain 0; load_scripts; expanded=0; back_to_menu ;;
             l|L) load_scripts; expanded=0 ;;
             q|Q|ESC) return 1 ;;
         esac
@@ -779,7 +882,7 @@ arrow_menu() {
 gum_menu() {
     local choice opts=() opt
     for opt in "${SCRIPTS_ARR[@]}"; do opts+=("$opt"); done
-    opts+=("Update all installed" "Remove a script" "Quit")
+    opts+=("Update all installed" "Remove a script" "Uninstall Inovatils" "Quit")
 
     while true; do
         choice="$(printf '%s\n' "${opts[@]}" | gum choose --height 15 --header "DevOps Utilities · select a script to run")"
@@ -787,6 +890,7 @@ gum_menu() {
             "") return 1 ;;
             "Update all installed") menu_update_all; load_scripts; back_to_menu ;;
             "Remove a script") menu_remove_gum ;;
+            "Uninstall Inovatils") do_uninstall_toolchain 0; back_to_menu ;;
             "Quit") return 1 ;;
             *) printf '\n'; run_script "$choice"; load_scripts; back_to_menu ;;
         esac
@@ -849,7 +953,7 @@ Usage:
   install.sh install                  install all available scripts
   install.sh install <script>         install a specific script
   install.sh i                        alias for "install"
-  install.sh uninstall                uninstall all available scripts
+  install.sh uninstall [-y]           completely uninstall inovatils and all devops-utilities
   install.sh uninstall <script>       uninstall a specific script
   install.sh u                        alias for "uninstall"
   install.sh update                   update all installed scripts
@@ -891,24 +995,21 @@ case "$CMD" in
         fi
         ;;
     u|uninstall|remove|rm)
-        if [ -n "${2:-}" ]; then
-            do_remove "$2"
-        else
-            load_scripts
-            info "Desinstalando todos os scripts disponíveis..."
-            local any=0
-            for name in "${SCRIPTS_ARR[@]}"; do
-                if is_installed "$name" || [ -f "${DEFAULT_INSTALL_DIR}/${name}" ]; then
-                    do_remove "$name"
-                    any=1
+        case "${2:-}" in
+            -y|--yes|--force)
+                do_uninstall_toolchain 1
+                ;;
+            "")
+                if [ "$CMD" = "remove" ] || [ "$CMD" = "rm" ]; then
+                    usage
+                else
+                    do_uninstall_toolchain 0
                 fi
-            done
-            if [ "$any" -eq 1 ]; then
-                ok "Desinstalação de todos os scripts concluída."
-            else
-                info "Nenhum script instalado encontrado para desinstalar."
-            fi
-        fi
+                ;;
+            *)
+                do_remove "$2"
+                ;;
+        esac
         ;;
     update)
         if [ -n "${2:-}" ]; then

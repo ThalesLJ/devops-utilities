@@ -72,7 +72,8 @@ Depois, use `inovatils` de qualquer lugar:
 inovatils                  # abre o menu interativo
 inovatils list             # lista scripts + status/versões
 inovatils install          # instala todos os scripts disponíveis (atalho: inovatils i)
-inovatils uninstall        # desinstala todos os scripts (atalho: inovatils u)
+inovatils uninstall        # desinstala completamente o inovatils e scripts (preserva serviços)
+inovatils uninstall -y     # desinstalação completa não interativa (automação)
 inovatils update           # atualiza todos os instalados
 inovatils self-update      # atualiza o próprio inovatils + gerenciador
 inovatils --help
@@ -81,6 +82,8 @@ inovatils --help
 > `inovatils` é um wrapper fino instalado em `/usr/local/bin/inovatils`;
 > o gerenciador em si fica em `~/.inova-devops/install.sh` e é atualizado
 > junto com `self-update`. Funciona em Linux, macOS e Windows (Git Bash/MSYS2/WSL).
+>
+> 💡 **Ciclo de Vida Recomendado**: Utilize o `inovatils` durante a configuração inicial do servidor para provisionar seus serviços (Docker, Evolution API, etc.). Após a conclusão do setup, você pode executar `inovatils uninstall -y` para remover toda a camada de scripts e ferramentas temporárias — todos os serviços configurados, containers e volumes permanecerão 100% ativos e operacionais.
 
 ### Menu interativo (sem o comando global)
 
@@ -122,8 +125,8 @@ curl -fsSL https://raw.githubusercontent.com/ThalesLJ/devops-utilities/main/inst
 | `inovatils list`               | Lista todos os utilitários do repositório exibindo versões local, remota e status de instalação. | `inovatils status`                                         | `inovatils list`                           |
 | `inovatils install`            | Baixa e instala todos os scripts disponíveis do repositório em `/usr/local/sbin/`.              | `inovatils i`                                              | `inovatils install` *(ou `inovatils i`)*   |
 | `inovatils install <script>`   | Baixa e instala o script informado em `/usr/local/sbin/` com permissão de execução.              | `inovatils i <script>`, `inovatils <script>`               | `inovatils install service-docker`         |
-| `inovatils uninstall`          | Desinstala e remove todos os scripts instalados do sistema.                                      | `inovatils u`                                              | `inovatils uninstall` *(ou `inovatils u`)* |
-| `inovatils uninstall <script>` | Remove e desinstala o script indicado do sistema.                                                | `inovatils u <script>`, `inovatils remove`, `inovatils rm` | `inovatils uninstall disk-health.sh`       |
+| `inovatils uninstall`          | Desinstala completamente o inovatils e todos os scripts instalados, preservando intactos todos os serviços configurados (Docker, Evolution API, containers, volumes). Suporta `-y` para automação. | `inovatils u` | `inovatils uninstall` *(ou `inovatils uninstall -y`)* |
+| `inovatils uninstall <script>` | Remove e desinstala apenas o script indicado do sistema, mantendo o `inovatils` ativo.           | `inovatils u <script>`, `inovatils remove`, `inovatils rm` | `inovatils uninstall disk-health.sh`       |
 | `inovatils update`             | Percorre e atualiza automaticamente todos os scripts atualmente instalados no sistema.           | —                                                          | `inovatils update`                         |
 | `inovatils update <script>`    | Atualiza um script específico instalado para a versão mais recente publicada no repositório.     | —                                                          | `inovatils update service-docker`          |
 | `inovatils self-update`        | Atualiza o próprio executável `inovatils` e o gerenciador local para a versão mais recente.      | —                                                          | `inovatils self-update`                    |
