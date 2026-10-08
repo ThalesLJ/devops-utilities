@@ -64,6 +64,9 @@ EVOLUTION_PORT="$DEFAULT_PORT"
 SERVER_URL=""
 AUTHENTICATION_API_KEY=""
 
+DEFAULT_SESSION_PHONE_CLIENT="Inova Evolution API"
+CONFIG_SESSION_PHONE_CLIENT=""
+
 DEFAULT_IMAGE="evoapicloud/evolution-api:v2.3.7"
 EVOLUTION_IMAGE="$DEFAULT_IMAGE"
 
@@ -324,6 +327,7 @@ Installation Options:
       --port PORT         HTTP port to bind (default: 8080).
       --api-key KEY       Custom global API key (auto-generated 64-char key if unset).
       --server-url URL    External or public server URL (auto-detected if unset).
+      --client-name NAME  WhatsApp session client name (default: Inova Evolution API).
       --image IMAGE       Evolution API Docker image (default: evoapicloud/evolution-api:v2.3.7).
       --no-systemd        Do not install systemd service unit.
 
@@ -346,6 +350,7 @@ General Options:
 Examples:
   $0                      Interactive installation wizard
   $0 -y                   Unattended automatic installation with secure defaults
+  $0 -y --client-name "Empresa"  Unattended install with custom WhatsApp client name
   $0 --apiKey             Display the configured Global API Key
   $0 --update             Safe update with pre-checks, snapshot, backup and healthcheck
   $0 --rollback           Roll back to the previous Evolution API image and configuration
@@ -378,6 +383,8 @@ while [ $# -gt 0 ]; do
         --api-key=*)            AUTHENTICATION_API_KEY="${1#*=}"; shift ;;
         --server-url)           SERVER_URL="$2"; shift 2 ;;
         --server-url=*)         SERVER_URL="${1#*=}"; shift ;;
+        --client-name)          CONFIG_SESSION_PHONE_CLIENT="$2"; shift 2 ;;
+        --client-name=*)        CONFIG_SESSION_PHONE_CLIENT="${1#*=}"; shift ;;
         --image)                EVOLUTION_IMAGE="$2"; shift 2 ;;
         --image=*)              EVOLUTION_IMAGE="${1#*=}"; shift ;;
         --no-systemd)           INSTALL_SYSTEMD=0; shift ;;
@@ -593,7 +600,10 @@ generate_configuration_files() {
         [ -z "$POSTGRES_PASSWORD" ] && POSTGRES_PASSWORD="$(grep -E '^POSTGRES_PASSWORD=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
         [ -z "$REDIS_PASSWORD" ] && REDIS_PASSWORD="$(grep -E '^REDIS_PASSWORD=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
         [ -z "$SERVER_URL" ] && SERVER_URL="$(grep -E '^SERVER_URL=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || true)"
+        [ -z "$CONFIG_SESSION_PHONE_CLIENT" ] && CONFIG_SESSION_PHONE_CLIENT="$(grep -E '^CONFIG_SESSION_PHONE_CLIENT=' "$env_file" 2>/dev/null | cut -d'=' -f2- | tr -d '\r' || true)"
     fi
+
+    [ -z "$CONFIG_SESSION_PHONE_CLIENT" ] && CONFIG_SESSION_PHONE_CLIENT="$DEFAULT_SESSION_PHONE_CLIENT"
 
     info "Writing environment file (.env)..."
     cat <<EOF > "$env_file"
@@ -636,7 +646,7 @@ CACHE_LOCAL_ENABLED=false
 
 # WhatsApp Baileys Client Settings
 DEL_INSTANCE=false
-CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API
+CONFIG_SESSION_PHONE_CLIENT=${CONFIG_SESSION_PHONE_CLIENT}
 CONFIG_SESSION_PHONE_NAME=Chrome
 
 # Logging Settings
@@ -723,7 +733,7 @@ services:
       - DATABASE_SAVE_DATA_LABELS=true
       - DATABASE_SAVE_DATA_HISTORIC=true
       - DEL_INSTANCE=false
-      - CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API
+      - CONFIG_SESSION_PHONE_CLIENT=${CONFIG_SESSION_PHONE_CLIENT:-Inova Evolution API}
       - CONFIG_SESSION_PHONE_NAME=Chrome
       - LOG_LEVEL=ERROR,WARN,INFO
       - LOG_COLOR=true
@@ -1528,11 +1538,13 @@ action_update() {
     cd "$INSTALL_DIR" || exit 1
 
     # 3. Read and preserve current environment
-    local cur_image cur_port cur_url
+    local cur_image cur_port cur_url cur_client
     cur_image="$(grep -E '^EVOLUTION_IMAGE=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "$DEFAULT_IMAGE")"
     [ -z "$cur_image" ] && cur_image="$DEFAULT_IMAGE"
     cur_port="$(grep -E '^SERVER_PORT=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "$DEFAULT_PORT")"
     cur_url="$(grep -E '^SERVER_URL=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d ' ' || echo "unknown")"
+    cur_client="$(grep -E '^CONFIG_SESSION_PHONE_CLIENT=' "${INSTALL_DIR}/.env" 2>/dev/null | cut -d'=' -f2- | tr -d '\r' || true)"
+    [ -z "$cur_client" ] && cur_client="$DEFAULT_SESSION_PHONE_CLIENT"
     EVOLUTION_PORT="$cur_port"
 
     # Target image
@@ -1558,6 +1570,7 @@ action_update() {
     printf '    %s %s\n' "Target Image      :" "$target_image"
     printf '    %s %s\n' "Configured Port   :" "$cur_port"
     printf '    %s %s\n' "Configured URL    :" "$cur_url"
+    printf '    %s %s\n' "Session Client    :" "$cur_client"
 
     # Interactive confirmation
     if [ "$ASSUME_YES" -eq 0 ]; then
@@ -1602,6 +1615,18 @@ action_update() {
         else
             printf 'EVOLUTION_IMAGE=%s\n' "$target_image" >> "${INSTALL_DIR}/.env"
         fi
+    fi
+
+    # Ensure legacy .env has CONFIG_SESSION_PHONE_CLIENT
+    if ! grep -q '^CONFIG_SESSION_PHONE_CLIENT=' "${INSTALL_DIR}/.env" 2>/dev/null; then
+        info "Legacy installation detected without CONFIG_SESSION_PHONE_CLIENT. Adding default..."
+        printf 'CONFIG_SESSION_PHONE_CLIENT=%s\n' "$DEFAULT_SESSION_PHONE_CLIENT" >> "${INSTALL_DIR}/.env"
+    fi
+
+    # Ensure docker-compose.yml uses dynamic session client reference
+    if grep -q 'CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API' "${INSTALL_DIR}/docker-compose.yml" 2>/dev/null; then
+        sed -i.bak 's|CONFIG_SESSION_PHONE_CLIENT=Inova Evolution API|CONFIG_SESSION_PHONE_CLIENT=${CONFIG_SESSION_PHONE_CLIENT:-Inova Evolution API}|' "${INSTALL_DIR}/docker-compose.yml" 2>/dev/null || true
+        rm -f "${INSTALL_DIR}/docker-compose.yml.bak" 2>/dev/null || true
     fi
 
     # 8. Pull new image
@@ -1681,6 +1706,7 @@ action_update() {
     printf '\n'
     printf '    %s %s -> %s\n' "Container Image:" "$cur_image" "${C_GREEN}${target_image}${C_RESET}"
     printf '    %s %s\n'      "API URL        :" "${C_CYAN}${cur_url}${C_RESET}"
+    printf '    %s %s\n'      "Session Client :" "${C_CYAN}${cur_client}${C_RESET}"
     printf '    %s %s\n'      "Pre-Update Snap:" "${C_CYAN}${snap_file}${C_RESET}"
     printf '    %s %s\n'      "Safety Backup  :" "${C_CYAN}${LATEST_BACKUP_FILE}${C_RESET}"
     printf '    %s %s\n'      "Rollback File  :" "${C_CYAN}${LATEST_MANIFEST}${C_RESET}"
@@ -1805,7 +1831,10 @@ main_install() {
         local gen_key
         gen_key="$(generate_secret 64)"
         prompt_value "Global Authentication API Key" "$gen_key" AUTHENTICATION_API_KEY
+        prompt_value "WhatsApp Session Client Name (displayed in linked devices)" "${CONFIG_SESSION_PHONE_CLIENT:-$DEFAULT_SESSION_PHONE_CLIENT}" CONFIG_SESSION_PHONE_CLIENT
     fi
+
+    CONFIG_SESSION_PHONE_CLIENT="${CONFIG_SESSION_PHONE_CLIENT:-$DEFAULT_SESSION_PHONE_CLIENT}"
 
     # Normalize directory path (convert Windows backslashes to Linux forward slashes, trim trailing slash)
     INSTALL_DIR="${INSTALL_DIR//\\//}"
@@ -1849,6 +1878,7 @@ main_install() {
         printf '    %s: %s\n' "Directory" "$INSTALL_DIR"
         printf '    %s: %s\n' "Port" "$EVOLUTION_PORT"
         printf '    %s: %s\n' "Server URL" "${SERVER_URL:-$(detect_server_url "$EVOLUTION_PORT")}"
+        printf '    %s: %s\n' "Session Client" "${CONFIG_SESSION_PHONE_CLIENT:-$DEFAULT_SESSION_PHONE_CLIENT}"
         printf '    %s: %s\n' "Image" "$EVOLUTION_IMAGE"
         printf '\n'
         if ! ask "Proceed with installation and container startup?"; then
@@ -1876,10 +1906,11 @@ main_install() {
     ok "Evolution API has been successfully installed and launched!"
     printf '\n'
     printf '  %s\n' "${C_BOLD}Access & Authentication Details:${C_RESET}"
-    printf '    %s %s\n' "API URL    :" "${C_CYAN}${SERVER_URL}${C_RESET}"
-    printf '    %s %s\n' "Healthcheck:" "${C_CYAN}${SERVER_URL}/${C_RESET}"
-    printf '    %s %s\n' "API Docs   :" "${C_CYAN}${SERVER_URL}/docs${C_RESET}"
-    printf '    %s %s\n' "API Key    :" "${C_YELLOW}${AUTHENTICATION_API_KEY}${C_RESET}"
+    printf '    %s %s\n' "API URL       :" "${C_CYAN}${SERVER_URL}${C_RESET}"
+    printf '    %s %s\n' "Healthcheck   :" "${C_CYAN}${SERVER_URL}/${C_RESET}"
+    printf '    %s %s\n' "API Docs      :" "${C_CYAN}${SERVER_URL}/docs${C_RESET}"
+    printf '    %s %s\n' "API Key       :" "${C_YELLOW}${AUTHENTICATION_API_KEY}${C_RESET}"
+    printf '    %s %s\n' "Session Client:" "${C_CYAN}${CONFIG_SESSION_PHONE_CLIENT}${C_RESET}"
     printf '\n'
     printf '  %s\n' "${C_BOLD}Architecture & Storage:${C_RESET}"
     printf '    %s %s\n' "Config Dir :" "${INSTALL_DIR}"

@@ -66,5 +66,5 @@ Read the local project documentation before changing architecture, behavior, rou
 
 <!-- SPECKIT START -->
 For additional context about technologies to be used, project structure,
-shell commands, and other important information, read the current plan: [`specs/001-docker-evolution-hardening/plan.md`](./specs/001-docker-evolution-hardening/plan.md) and [`Specify folder`](./specify)
+shell commands, and other important information, read the current plan: [`specs/002-evolution-client-name/plan.md`](./specs/002-evolution-client-name/plan.md) and [`Specify folder`](./specify)
 <!-- SPECKIT END -->
